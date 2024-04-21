@@ -1,0 +1,4 @@
+#!/bin/bash
+
+sudo ln -s "$PWD/neith" /usr/local/bin/
+sudo ln -s "$PWD/shlib/" /usr/local/bin/

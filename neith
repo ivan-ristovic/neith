@@ -1,0 +1,94 @@
+#!/bin/bash
+
+neith_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+source ${SHLIB_ROOT:-"$neith_dir/shlib"}/lib.sh
+
+function usage ()
+{
+    echo -e "usage: $0 [opts] query..."
+    echo -e "opts:"
+    echo -e "  [--help    | -h]"
+    echo -e "  [--verbose | -v]"
+    echo
+    echo "Environment:"
+    echo -e "  NEITH_LIBS=$NEITH_LIBS"
+    exit 2
+}
+
+SHORT_OPTS=h,v
+LONG_OPTS=help,verbose
+OPTS=$(getopt --alternative --name 'argument error' --options $SHORT_OPTS --longoptions $LONG_OPTS -- "$@") 
+if [ $? -ne 0 ]; then
+    std::fat "failed to parse provided arguments"
+fi
+eval set -- $OPTS
+
+while :
+do
+    case "$1" in
+        -v | --verbose)
+            export SHLIB_LOG_DEBUG=true
+            ;;
+        -h | --help)
+            usage
+            ;;
+        --)
+            shift;
+            break
+            ;;
+        *)
+            log::err "unknown option: $1"
+            usage
+            ;;
+    esac
+    shift;
+done
+
+log::dbg "NEITH_LIBS=$NEITH_LIBS"
+
+# Parse lib folders
+if ! test::var_set NEITH_LIBS ; then
+    log::dbg "NEITH_LIBS not set, adding '$neith_dir' to libs"
+    NEITH_LIBS="$neith_dir"
+fi
+libs=$(str::split ":" "$NEITH_LIBS")
+libs=$(arr::uniq $libs)
+
+# Search
+INITIAL_QUERY="${*:-}"
+
+## 1. Focused search
+fd -a --type file . "${libs[*]}" |
+  fzf --query "$INITIAL_QUERY" \
+      --prompt 'F> ' \
+      --header 'Ctrl-T: Toggle files/dirs' \
+      --bind 'ctrl-t:transform:[[ ! $FZF_PROMPT =~ F ]] &&
+              echo "change-prompt(F> )+reload(fd -a --type file)" ||
+              echo "change-prompt(D> )+reload(fd -a --type directory)"' \
+      --bind 'ctrl-d:transform:exit 0' \
+      --color "hl:-1:underline,hl+:-1:underline:reverse" \
+      --preview '[[ $FZF_PROMPT =~ F ]] && bat --color=always {} || tree -C {}' \
+      --preview-window 'up,60%,border-bottom' \
+      --delimiter : \
+      --bind "enter:become($EDITOR {1})" 
+
+## 2. Search descriptions if user did not select any file
+if [ $? -eq 0 ]; then
+    exit 0
+fi
+rm -f /tmp/neith-*
+RG_PREFIX="rg --column --line-number --no-heading --color=always --smart-case "
+: | fzf --ansi --disabled --query "$INITIAL_QUERY" \
+    --bind "start:reload:$RG_PREFIX {q} ${libs[*]}" \
+    --bind "change:reload:sleep 0.1; $RG_PREFIX {q} ${libs[*]} || true" \
+    --bind 'ctrl-t:transform:[[ ! $FZF_PROMPT =~ rg ]] &&
+      echo "rebind(change)+change-prompt(1. rg> )+disable-search+transform-query:echo \{q} > /tmp/neith-rg-fzf-f; cat /tmp/neith-rg-fzf-r" ||
+      echo "unbind(change)+change-prompt(2. fzf> )+enable-search+transform-query:echo \{q} > /tmp/neith-rg-fzf-r; cat /tmp/neith-rg-fzf-f"' \
+    --color "hl:-1:underline,hl+:-1:underline:reverse" \
+    --prompt '[Ctrl+T to swap] 1. rg> ' \
+    --delimiter : \
+    --preview 'bat --color=always {1} --highlight-line {2}' \
+    --preview-window 'up,60%,border-bottom,+{2}+3/3,~3' \
+    --bind "enter:become($EDITOR {1} +{2})"
+
+
