@@ -21,6 +21,7 @@ NEITH_RG_PATH=${NEITH_RG_PATH:-"rg"}
 assert::installed "$NEITH_FD_PATH"
 assert::installed "$NEITH_FZF_PATH"
 assert::installed "$NEITH_RG_PATH"
+assert::installed "bat"
 
 SHORT_OPTS=h,v
 LONG_OPTS=help,verbose
@@ -65,13 +66,13 @@ libs=$(arr::uniq $libs)
 INITIAL_QUERY="${*:-}"
 
 ## 1. Focused search
-fd -a --type file . ${libs[@]} |
-  fzf --query "$INITIAL_QUERY" \
+"$NEITH_FD_PATH" -a --type file . ${libs[@]} |
+  "$NEITH_FZF_PATH" --query "$INITIAL_QUERY" \
       --prompt 'F> ' \
       --header 'Ctrl-T: Toggle files/dirs' \
-      --bind 'ctrl-t:transform:[[ ! $FZF_PROMPT =~ F ]] &&
-              echo "change-prompt(F> )+reload(fd -a --type file)" ||
-              echo "change-prompt(D> )+reload(fd -a --type directory)"' \
+      --bind "ctrl-t:transform:[[ ! \$FZF_PROMPT =~ F ]] &&
+              echo \"change-prompt(F> )+reload($NEITH_FD_PATH -a --type file)\" ||
+              echo \"change-prompt(D> )+reload($NEITH_FD_PATH -a --type directory)\"" \
       --bind 'ctrl-d:transform:exit 0' \
       --color "hl:-1:underline,hl+:-1:underline:reverse" \
       --preview '[[ $FZF_PROMPT =~ F ]] && bat --color=always {} || tree -C {}' \
@@ -84,8 +85,8 @@ if [ $? -eq 0 ]; then
     exit 0
 fi
 rm -f /tmp/neith-*
-RG_PREFIX="rg --column --line-number --no-heading --color=always --smart-case "
-: | fzf --ansi --disabled --query "$INITIAL_QUERY" \
+RG_PREFIX="$NEITH_RG_PATH --column --line-number --no-heading --color=always --smart-case "
+: | "$NEITH_FZF_PATH" --ansi --disabled --query "$INITIAL_QUERY" \
     --bind "start:reload:$RG_PREFIX {q} ${libs[*]}" \
     --bind "change:reload:sleep 0.1; $RG_PREFIX {q} ${libs[*]} || true" \
     --bind 'ctrl-t:transform:[[ ! $FZF_PROMPT =~ rg ]] &&
