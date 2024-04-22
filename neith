@@ -58,7 +58,7 @@ libs=$(arr::uniq $libs)
 INITIAL_QUERY="${*:-}"
 
 ## 1. Focused search
-fd -a --type file . "${libs[*]}" |
+fd -a --type file . ${libs[@]} |
   fzf --query "$INITIAL_QUERY" \
       --prompt 'F> ' \
       --header 'Ctrl-T: Toggle files/dirs' \
