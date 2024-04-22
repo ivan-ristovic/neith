@@ -15,6 +15,13 @@ function usage ()
     exit 2
 }
 
+NEITH_FD_PATH=${NEITH_FD_PATH:-"fd"}
+NEITH_FZF_PATH=${NEITH_FZF_PATH:-"fzf"}
+NEITH_RG_PATH=${NEITH_RG_PATH:-"rg"}
+assert::installed "$NEITH_FD_PATH"
+assert::installed "$NEITH_FZF_PATH"
+assert::installed "$NEITH_RG_PATH"
+
 SHORT_OPTS=h,v
 LONG_OPTS=help,verbose
 OPTS=$(getopt --alternative --name 'argument error' --options $SHORT_OPTS --longoptions $LONG_OPTS -- "$@") 
