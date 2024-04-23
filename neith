@@ -85,14 +85,18 @@ libs=$(arr::uniq $libs)
 readarray -t libs <<<"$libs"
 
 # Add
-if [ ! -z "$NEITH_CMD_ADD" ]; then
-    for i in "${!libs[@]}"; do 
-        printf "%s: %s\n" "$i" "${libs[$i]}"
-    done
-    read -p "Please select index of the lib to use (default: 0): " index
+if [ -n "$NEITH_CMD_ADD" ]; then
+    lib_count=$(arr::size libs)
+    if [ "$lib_count" -gt 1 ]; then
+        for i in "${!libs[@]}"; do 
+            printf "%s: %s\n" "$i" "${libs[$i]}"
+        done
+        read -p "Please select index of the lib to use (default: 0): " index
+    fi
     lib=${libs[${index:-0}]}
     log::dbg "Selected lib: ${lib}"
-    log::exec "$EDITOR" "$lib/$NEITH_CMD_ADD"
+    path=$(os::path "$lib/$NEITH_CMD_ADD")
+    log::exec "$EDITOR" "$path"
 fi
 
 # Search
