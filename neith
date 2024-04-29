@@ -8,6 +8,7 @@ function usage ()
     echo -e "usage: $0 [opts] [query...]"
     echo -e "opts:"
     echo -e "  [--add     | -a] <category>"
+    echo -e "  [--push    | -p]"
     echo -e "  [--help    | -h]"
     echo -e "  [--verbose | -v]"
     echo
@@ -16,8 +17,8 @@ function usage ()
     exit 2
 }
 
-SHORT_OPTS=h,v,a:
-LONG_OPTS=help,verbose,add:
+SHORT_OPTS=h,v,p,a:
+LONG_OPTS=help,verbose,push,add:
 OPTS=$(getopt --alternative --name 'argument error' --options $SHORT_OPTS --longoptions $LONG_OPTS -- "$@") 
 if [ $? -ne 0 ]; then
     std::fat "failed to parse provided arguments"
@@ -26,6 +27,7 @@ eval set -- $OPTS
 
 NEITH_CMD_ADD=""
 NEITH_CMD_SEARCH=true
+NEITH_PUSH_LIB_UPDATE=false
 
 while :
 do
@@ -34,6 +36,9 @@ do
             shift
             NEITH_CMD_ADD="$1"
             NEITH_CMD_SEARCH=false
+            ;;
+        -p | --push)
+            NEITH_PUSH_LIB_UPDATE=true
             ;;
         -v | --verbose)
             export SHLIB_LOG_DEBUG=true
@@ -84,8 +89,9 @@ libs=$(str::split ":" "$NEITH_LIBS")
 libs=$(arr::uniq $libs)
 readarray -t libs <<<"$libs"
 
-# Add
-if [ -n "$NEITH_CMD_ADD" ]; then
+function choose_lib ()
+{
+    local lib_count
     lib_count=$(arr::size libs)
     if [ "$lib_count" -gt 1 ]; then
         for i in "${!libs[@]}"; do 
@@ -94,9 +100,29 @@ if [ -n "$NEITH_CMD_ADD" ]; then
         read -p "Please select index of the lib to use (default: 0): " index
     fi
     lib=${libs[${index:-0}]}
+    echo "$lib"
+}
+
+# Add
+if [ -n "$NEITH_CMD_ADD" ]; then
+    lib=$(choose_lib)
     log::dbg "Selected lib: ${lib}"
     path=$(os::path "$lib/$NEITH_CMD_ADD")
     log::exec "$EDITOR" "$path"
+fi
+
+# Push
+if [ -n "$NEITH_PUSH_LIB_UPDATE" ]; then
+    lib=$(choose_lib)
+    log::dbg "Selected lib: ${lib}"
+    pushd "$lib" || std::fat "failed to enter dir: $lib"
+    set -e
+    git pull
+    git add --all
+    git commit -m "neith: update lib"
+    git push
+    popd
+    exit 0
 fi
 
 # Search
