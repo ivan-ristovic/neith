@@ -32,7 +32,7 @@ Dependencies:
 - `fd-find` or `fd` for short - for filename search 
 - `fzf` - for fuzz search
 - `ripgrep` - for file-content search
-- `bat - for file/directory previews
+- `bat` - for file/directory previews
 - `shlib` - my custom shell scripting library bundled in this repository
 
 Installation:
