@@ -3,4 +3,7 @@
 set -xe;
 
 sudo ln -s "$PWD/neith" /usr/local/bin/
+
+# shlib
+git submodule init shlib
 sudo ln -s "$PWD/shlib/" /usr/local/bin/
