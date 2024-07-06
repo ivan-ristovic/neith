@@ -23,7 +23,7 @@ If there are many results, using `Ctrl+T` in this mode instructs Neith to fuzzil
 For example, searching for `unix` in content search mode:
 ![](images/example-next-alt-1.png)
 and then filtering through results:
-![](images/example-next-alt.png)
+![](images/example-next-alt-2.png)
 
 
 ## Setup
