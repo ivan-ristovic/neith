@@ -1,5 +1,7 @@
 # Neith
 
+![](images/example-main.png)
+
 Neith is a knowledge library query script. In Egyptian mythology, Neith was a deity associated with cosmos, fate, and wisdom ([wiki](https://en.wikipedia.org/wiki/Neith)).
 
 The primary use-case for Neith is to provide quick and **correct** answers to often repeated queries, or to serve as a search tool for libraries. A *library* is a structured directory containing topics (subdirectories) and knowledge entries (files) prepared as an index. Neith performs two searches - first one over the relative library paths to quickly find files matching the query, or second one over the file contents in cases where the first search doesn't retrieve desired results.
@@ -39,9 +41,13 @@ Installation:
 - Run the `setup` script
 - Check if everything worked by invoking `neith`
 
+Setting the library:
+- Set the `NEITH_LIBS` environment variable in your shell `.profile` file
+- If you have multiple libraries you wish to query with Neith, use `:` to separate them
+
 `tmux` integration (recommended for maximum efficiency):
 - Add to `tmux.conf`:
-```
+```sh
 bind-key -r N display-popup -E -T "Neith" -h "80%" -w "60%" "neith"
 ```
 - This will open Neith with `<tmux-prefix> + Shift+n` without the need for a new terminal window/pane!
@@ -51,5 +57,11 @@ bind-key -r N display-popup -E -T "Neith" -h "80%" -w "60%" "neith"
 
 ## Preparing the knowledge library
 
-Neith is only useful if your library is extensive. Neith can work with an arbitrary amount of separate library directories. You need to make the commitment to _record_ things you discover along the way. To make this process easier, Neith adds a flag `-a` that allows you to quickly add new entries to the library, and to version control libraries. There are several excellent libraries out there already on [GitHub](https://github.com/topics/today-i-learned), that can be used as-they-are with Neith! 
+Neith can work with an arbitrary amount of separate library directories. You need to make the commitment to _record_ things you discover along the way. To make this process easier, Neith adds a flag `-a` that allows you to quickly add new entries to the library, and to version control libraries. There are several excellent libraries out there already on [GitHub](https://github.com/topics/today-i-learned), that can be used as-they-are with Neith! 
+
+Neith is only useful if your library is extensive, and this is the main weakness of Neith, as most people do not have the patience to do this. I personally find Neith useful for those not-so-simple answers that I know I need to save for the future because I browser for hours to find them and don't want to repeat that again. For all the simple queries, Google or Stack Overflow is your friend. Neith does not aim to replace tools such as [cht.sh](https://github.com/chubin/cheat.sh) and similar, nor should you stop using them if you use Neith. I think the combination of the two is best for most people, and can be added into the tmux integration (depending on which tool you use more often):
+```sh
+bind-key -r N display-popup -E -T "Neith" -h "80%" -w "60%" "cht.sh --shell || neith"
+```
+
 
