@@ -135,8 +135,8 @@ if [ "$NEITH_CMD_SEARCH" == "true" ]; then
           --prompt 'F> ' \
           --header 'Ctrl-T: Toggle files/dirs' \
           --bind "ctrl-t:transform:[[ ! \$FZF_PROMPT =~ F ]] &&
-                  echo \"change-prompt(F> )+reload($NEITH_FD_PATH -a --type file)\" ||
-                  echo \"change-prompt(D> )+reload($NEITH_FD_PATH -a --type directory)\"" \
+                  echo \"change-prompt(F> )+reload($NEITH_FD_PATH -a -t f . ${libs[*]})\" ||
+                  echo \"change-prompt(D> )+reload($NEITH_FD_PATH -a -t d . ${libs[*]})\"" \
           --bind 'ctrl-d:transform:exit 0' \
           --color "hl:-1:underline,hl+:-1:underline:reverse" \
           --preview '[[ $FZF_PROMPT =~ F ]] && bat --color=always {} || tree -C {}' \
