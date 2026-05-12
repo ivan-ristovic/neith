@@ -7,7 +7,7 @@ function usage ()
 {
     echo -e "usage: $0 [opts] [query...]"
     echo -e "opts:"
-    echo -e "  [--add     | -a] <category>"
+    echo -e "  [--add     | -a] <category> [query...]"
     echo -e "  [--push    | -p]"
     echo -e "  [--help    | -h]"
     echo -e "  [--verbose | -v]"
@@ -73,10 +73,14 @@ done
 NEITH_FD_PATH=${NEITH_FD_PATH:-"fd"}
 NEITH_FZF_PATH=${NEITH_FZF_PATH:-"fzf"}
 NEITH_RG_PATH=${NEITH_RG_PATH:-"rg"}
+NEITH_BAT_PATH=${NEITH_BAT_PATH:-"bat"}
+NEITH_NOTE_TEMPLATE=${NEITH_NOTE_TEMPLATE:-"$neith_dir/.neith-note-template.md"}
 assert::installed "$NEITH_FD_PATH"
 assert::installed "$NEITH_FZF_PATH"
 assert::installed "$NEITH_RG_PATH"
-assert::installed "bat"
+assert::installed "$NEITH_BAT_PATH"
+assert::installed "man"
+assert::installed "col"
 
 log::dbg "NEITH_LIBS=$NEITH_LIBS"
 
@@ -103,12 +107,112 @@ function choose_lib ()
     echo "$lib"
 }
 
+function str_trim ()
+{
+    local value=$1
+
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+function title_from_query ()
+{
+    local query
+
+    query=$(str_trim "$1")
+    printf '%s' "$query" |
+        tr '_-' '  ' |
+        awk '{ for (i = 1; i <= NF; i++) $i = toupper(substr($i, 1, 1)) substr($i, 2); print }'
+}
+
+function slug_from_query ()
+{
+    local query slug
+
+    query=$(str_trim "$1")
+    slug=$(printf '%s' "$query" |
+        tr '[:upper:]' '[:lower:]' |
+        sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+
+    printf '%s' "${slug:-note}"
+}
+
+function render_note_template ()
+{
+    local title=$1
+    local target=$2
+    local line
+
+    if [ -f "$NEITH_NOTE_TEMPLATE" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            printf '%s\n' "${line//\{\{TITLE\}\}/$title}"
+        done < "$NEITH_NOTE_TEMPLATE" > "$target"
+    else
+        {
+            printf '# %s\n\n' "$title"
+            printf '> Manually created note. Verify commands and references before using them on important systems.\n\n'
+            printf 'Write the task-focused note here.\n\n'
+            printf '```bash\n# command or snippet\n```\n\n'
+            printf '## References\n\n'
+            printf -- '- TODO: add reference\n'
+        } > "$target"
+    fi
+}
+
+function note_body_line ()
+{
+    local path=$1
+    local line
+
+    line=$(grep -n -m 1 '^Write the task-focused note here\.$' "$path" | cut -d: -f1)
+    printf '%s' "${line:-1}"
+}
+
+function note_path_for ()
+{
+    local dir=$1
+    local query=$2
+    local slug
+
+    slug=$(slug_from_query "$query")
+    printf '%s/%s.md' "$dir" "$slug"
+}
+
+function create_note ()
+{
+    local dir=$1
+    local query=$2
+    local title path tmp
+
+    query=$(str_trim "$query")
+    [ -n "$query" ] || std::fat "note title/query must not be empty"
+
+    mkdir -p "$dir" || std::fat "failed to create directory: $dir"
+    path=$(note_path_for "$dir" "$query")
+
+    if [ ! -e "$path" ]; then
+        title=$(title_from_query "$query")
+        tmp="${path}.tmp.$$"
+        render_note_template "$title" "$tmp"
+        mv "$tmp" "$path" || std::fat "failed to create note: $path"
+    fi
+
+    printf '%s' "$path"
+}
+
 # Add
 if [ -n "$NEITH_CMD_ADD" ]; then
     lib=$(choose_lib)
     log::dbg "Selected lib: ${lib}"
     path=$(os::path "$lib/$NEITH_CMD_ADD")
-    log::exec "$EDITOR" "$path"
+    if [ -n "${*:-}" ]; then
+        path=$(create_note "$path" "${*:-}")
+        line=$(note_body_line "$path")
+        log::exec "$EDITOR" "$path" "+$line"
+    else
+        log::exec "$EDITOR" "$path"
+    fi
 fi
 
 # Push
@@ -129,37 +233,998 @@ fi
 if [ "$NEITH_CMD_SEARCH" == "true" ]; then
     INITIAL_QUERY="${*:-}"
 
-    ## 1. Focused search
-    "$NEITH_FD_PATH" -a --type file . ${libs[@]} |
-      "$NEITH_FZF_PATH" --query "$INITIAL_QUERY" \
-          --prompt 'F> ' \
-          --header 'Ctrl-T: Toggle files/dirs' \
-          --bind "ctrl-t:transform:[[ ! \$FZF_PROMPT =~ F ]] &&
-                  echo \"change-prompt(F> )+reload($NEITH_FD_PATH -a -t f . ${libs[*]})\" ||
-                  echo \"change-prompt(D> )+reload($NEITH_FD_PATH -a -t d . ${libs[*]})\"" \
-          --bind 'ctrl-d:transform:exit 0' \
-          --color "hl:-1:underline,hl+:-1:underline:reverse" \
-          --preview '[[ $FZF_PROMPT =~ F ]] && bat --color=always {} || tree -C {}' \
-          --preview-window 'up,60%,border-bottom' \
-          --delimiter : \
-          --bind "enter:become($EDITOR {1})" 
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/neith-fzf.XXXXXX")
+    helper="$tmp_dir/helper"
+    libs_file="$tmp_dir/libs"
+    printf '%s\n' "${libs[@]}" > "$libs_file"
+    printf 'file' > "$tmp_dir/mode"
+    printf 'file' > "$tmp_dir/file_mode"
+    printf 'regex' > "$tmp_dir/content_mode"
+    printf '' > "$tmp_dir/live_query"
+    printf '' > "$tmp_dir/pre_filter_mode"
+    printf '' > "$tmp_dir/frozen"
+    printf '' > "$tmp_dir/add_prev_mode"
+    printf '' > "$tmp_dir/add_prev_query"
+    printf '' > "$tmp_dir/add_query"
+    printf '' > "$tmp_dir/add_seed"
+    printf '' > "$tmp_dir/add_root"
 
-    ## 2. Search descriptions if user did not select any file
-    if [ $? -eq 0 ]; then
-        exit 0
+    function cleanup_search ()
+    {
+        rm -rf "$tmp_dir"
+    }
+    trap cleanup_search EXIT
+
+    cat > "$helper" <<'NEITH_FZF_HELPER'
+#!/usr/bin/env bash
+set -u
+
+tmp_dir=${NEITH_FZF_TMP:?}
+libs_file=${NEITH_FZF_LIBS_FILE:?}
+fd_path=${NEITH_FD_PATH:-fd}
+fzf_path=${NEITH_FZF_PATH:-fzf}
+rg_path=${NEITH_RG_PATH:-rg}
+bat_path=${NEITH_BAT_PATH:-bat}
+note_template=${NEITH_NOTE_TEMPLATE:-}
+editor=${EDITOR:-vi}
+tab=$'\t'
+man_query_sep=$'\037'
+
+mapfile -t libs < "$libs_file"
+
+mode_file="$tmp_dir/mode"
+file_mode_file="$tmp_dir/file_mode"
+content_mode_file="$tmp_dir/content_mode"
+pre_filter_mode_file="$tmp_dir/pre_filter_mode"
+live_query_file="$tmp_dir/live_query"
+frozen_file="$tmp_dir/frozen"
+add_prev_mode_file="$tmp_dir/add_prev_mode"
+add_prev_query_file="$tmp_dir/add_prev_query"
+add_query_file="$tmp_dir/add_query"
+add_seed_file="$tmp_dir/add_seed"
+add_root_file="$tmp_dir/add_root"
+man_dir="$tmp_dir/man"
+mkdir -p "$man_dir"
+
+function read_state ()
+{
+    local file=$1
+    local default=$2
+
+    if [[ -s "$file" ]]; then
+        cat "$file"
+    else
+        printf '%s' "$default"
     fi
-    rm -f /tmp/neith-*
-    RG_PREFIX="$NEITH_RG_PATH --column --line-number --no-heading --color=always --smart-case "
-    : | "$NEITH_FZF_PATH" --ansi --disabled --query "$INITIAL_QUERY" \
-        --bind "start:reload:$RG_PREFIX {q} ${libs[*]}" \
-        --bind "change:reload:sleep 0.1; $RG_PREFIX {q} ${libs[*]} || true" \
-        --bind 'ctrl-t:transform:[[ ! $FZF_PROMPT =~ rg ]] &&
-          echo "rebind(change)+change-prompt(1. rg> )+disable-search+transform-query:echo \{q} > /tmp/neith-rg-fzf-f; cat /tmp/neith-rg-fzf-r" ||
-          echo "unbind(change)+change-prompt(2. fzf> )+enable-search+transform-query:echo \{q} > /tmp/neith-rg-fzf-r; cat /tmp/neith-rg-fzf-f"' \
+}
+
+function write_state ()
+{
+    local file=$1
+    local value=$2
+
+    printf '%s' "$value" > "$file"
+}
+
+function current_mode ()
+{
+    read_state "$mode_file" "file"
+}
+
+function prompt_for ()
+{
+    case "$1" in
+        file) printf 'F:file> ' ;;
+        dir) printf 'F:dir> ' ;;
+        content_regex) printf 'C:regex> ' ;;
+        content_lit) printf 'C:lit> ' ;;
+        filter_file|filter_dir) printf 'F:filter> ' ;;
+        filter_content_regex|filter_content_lit) printf 'C:filter> ' ;;
+        add) printf 'A:dir> ' ;;
+        *) printf 'F:file> ' ;;
+    esac
+}
+
+function search_action_for ()
+{
+    case "$1" in
+        content_regex|content_lit) printf 'disable-search' ;;
+        *) printf 'enable-search' ;;
+    esac
+}
+
+function header_for ()
+{
+    case "$1" in
+        add) printf 'Enter: select/create | Ctrl-A: cancel | Esc: quit' ;;
+        *) printf 'Tab: mode | Ctrl-T: toggle | Ctrl-F: filter | Ctrl-A: add | Enter: open | Esc: quit' ;;
+    esac
+}
+
+function actions_for_mode ()
+{
+    local mode=$1
+
+    printf 'change-prompt(%s)+change-header(%s)+%s' \
+        "$(prompt_for "$mode")" "$(header_for "$mode")" "$(search_action_for "$mode")"
+}
+
+function emit_candidate ()
+{
+    local kind=$1
+    local path=$2
+    local line=$3
+    local title=$4
+    local display=$5
+
+    printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$path" "$line" "$title" "$display"
+}
+
+function trim_string ()
+{
+    local value=$1
+
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+function split_man_query ()
+{
+    local query=$1
+    local trimmed first rest section title remainder
+
+    trimmed=$(trim_string "$query")
+    [[ -n "$trimmed" ]] || return 1
+
+    if [[ "$trimmed" =~ ^([^[:space:]()]+)\(([^()[:space:]]+)\)([[:space:]]+(.*))?$ ]]; then
+        title=${BASH_REMATCH[1]}
+        section=${BASH_REMATCH[2]}
+        remainder=${BASH_REMATCH[4]:-}
+        printf '%s%s%s%s%s\n' "$section" "$man_query_sep" "$title" "$man_query_sep" "$remainder"
+        return 0
+    fi
+
+    first="${trimmed%%[[:space:]]*}"
+    rest="${trimmed#"$first"}"
+    rest=$(trim_string "$rest")
+
+    if [[ -n "$rest" && "$first" =~ ^([0-9][A-Za-z0-9]*|n|l)$ ]]; then
+        section=$first
+        title="${rest%%[[:space:]]*}"
+        remainder="${rest#"$title"}"
+        remainder=$(trim_string "$remainder")
+        [[ -n "$title" ]] || return 1
+        printf '%s%s%s%s%s\n' "$section" "$man_query_sep" "$title" "$man_query_sep" "$remainder"
+        return 0
+    fi
+
+    title=$first
+    remainder=$rest
+    printf '%s%s%s%s%s\n' "" "$man_query_sep" "$title" "$man_query_sep" "$remainder"
+}
+
+function title_from_query ()
+{
+    local query
+
+    query=$(trim_string "$1")
+    printf '%s' "$query" |
+        tr '_-' '  ' |
+        awk '{ for (i = 1; i <= NF; i++) $i = toupper(substr($i, 1, 1)) substr($i, 2); print }'
+}
+
+function slug_from_query ()
+{
+    local query slug
+
+    query=$(trim_string "$1")
+    slug=$(printf '%s' "$query" |
+        tr '[:upper:]' '[:lower:]' |
+        sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+
+    printf '%s' "${slug:-note}"
+}
+
+function slug_path_component ()
+{
+    slug_from_query "$1"
+}
+
+function note_body_line ()
+{
+    local path=$1
+    local line
+
+    line=$(grep -n -m 1 '^Write the task-focused note here\.$' "$path" | cut -d: -f1)
+    printf '%s' "${line:-1}"
+}
+
+function render_note_template ()
+{
+    local title=$1
+    local target=$2
+    local line
+
+    if [[ -n "$note_template" && -f "$note_template" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            printf '%s\n' "${line//\{\{TITLE\}\}/$title}"
+        done < "$note_template" > "$target"
+    else
+        {
+            printf '# %s\n\n' "$title"
+            printf '> Manually created note. Verify commands and references before using them on important systems.\n\n'
+            printf 'Write the task-focused note here.\n\n'
+            printf '```bash\n# command or snippet\n```\n\n'
+            printf '## References\n\n'
+            printf -- '- TODO: add reference\n'
+        } > "$target"
+    fi
+}
+
+function create_note ()
+{
+    local dir=$1
+    local query=$2
+    local title slug path tmp
+
+    query=$(trim_string "$query")
+    [[ -n "$query" ]] || return 1
+
+    mkdir -p "$dir" || return 1
+    slug=$(slug_from_query "$query")
+    path="$dir/$slug.md"
+
+    if [[ ! -e "$path" ]]; then
+        title=$(title_from_query "$query")
+        tmp="${path}.tmp.$$"
+        render_note_template "$title" "$tmp" || return 1
+        mv "$tmp" "$path" || return 1
+    fi
+
+    printf '%s' "$path"
+}
+
+function lib_for_path ()
+{
+    local path=$1
+    local lib
+
+    for lib in "${libs[@]}"; do
+        if [[ "$path" == "$lib" || "$path" == "$lib"/* ]]; then
+            printf '%s' "$lib"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+function relative_to_lib ()
+{
+    local path=$1
+    local lib=$2
+
+    if [[ "$path" == "$lib" ]]; then
+        printf '.'
+    else
+        printf '%s' "${path#"$lib"/}"
+    fi
+}
+
+function selected_item_path ()
+{
+    local item=$1
+    local kind path line title display
+
+    IFS=$'\t' read -r kind path line title display <<< "$item"
+    printf '%s' "${path:-}"
+}
+
+function selected_item_title ()
+{
+    local item=$1
+    local kind path line title display base
+
+    IFS=$'\t' read -r kind path line title display <<< "$item"
+    if [[ -n "${title:-}" ]]; then
+        printf '%s' "$title"
+        return
+    fi
+
+    [[ -n "${path:-}" ]] || return 0
+    base=$(basename "$path")
+    base="${base%.md}"
+    base="${base%.txt}"
+    title_from_query "$base"
+}
+
+function selected_item_parent_seed ()
+{
+    local item=$1
+    local kind path line title display parent lib rel
+
+    IFS=$'\t' read -r kind path line title display <<< "$item"
+    [[ -n "${path:-}" ]] || return 1
+
+    case "$kind" in
+        dir|add_dir) parent="$path" ;;
+        file|content) parent=$(dirname "$path") ;;
+        *) return 1 ;;
+    esac
+
+    lib=$(lib_for_path "$parent") || return 1
+    rel=$(relative_to_lib "$parent" "$lib")
+    [[ "$rel" != "." ]] || return 1
+    printf '%s' "$rel"
+}
+
+function first_query_word ()
+{
+    local query=$1
+
+    query=$(trim_string "$query")
+    [[ -n "$query" ]] || return 1
+    printf '%s' "${query%%[[:space:]]*}"
+}
+
+function safe_relative_dir ()
+{
+    local value=$1
+    local part out slug
+
+    value=$(trim_string "$value")
+    value="${value#./}"
+    value="${value#/}"
+    [[ -n "$value" ]] || return 1
+
+    IFS='/' read -ra parts <<< "$value"
+    out=""
+    for part in "${parts[@]}"; do
+        part=$(trim_string "$part")
+        [[ "$part" != "." && "$part" != ".." ]] || return 1
+        slug=$(slug_path_component "$part")
+        [[ -n "$slug" && "$slug" != "note" ]] || continue
+        if [[ -n "$out" ]]; then
+            out+="/$slug"
+        else
+            out="$slug"
+        fi
+    done
+
+    [[ -n "$out" ]] || return 1
+    printf '%s' "$out"
+}
+
+function choose_new_dir_root ()
+{
+    local root index
+
+    root=$(read_state "$add_root_file" "")
+    if [[ -n "$root" ]]; then
+        printf '%s' "$root"
+        return 0
+    fi
+
+    if [[ "${#libs[@]}" -eq 1 ]]; then
+        printf '%s' "${libs[0]}"
+        return 0
+    fi
+
+    printf 'Select library root for the new directory:\n' > /dev/tty
+    for index in "${!libs[@]}"; do
+        printf '%s: %s\n' "$index" "${libs[$index]}" > /dev/tty
+    done
+    printf 'Index: ' > /dev/tty
+    read -r index < /dev/tty
+    [[ "$index" =~ ^[0-9]+$ && -n "${libs[$index]:-}" ]] || return 1
+    printf '%s' "${libs[$index]}"
+}
+
+function man_section_from_path ()
+{
+    local path=$1
+    local base
+
+    base=$(basename "$path")
+    while [[ "$base" =~ \.(gz|bz2|xz|lzma|zst|br|lz)$ ]]; do
+        base="${base%.*}"
+    done
+
+    if [[ "$base" == *.* ]]; then
+        printf '%s' "${base##*.}"
+    fi
+}
+
+function man_page_label ()
+{
+    local title=$1
+    local section=$2
+
+    if [[ -n "$section" ]]; then
+        printf '%s(%s)' "$title" "$section"
+    else
+        printf '%s' "$title"
+    fi
+}
+
+function safe_man_component ()
+{
+    local value=$1
+
+    value="${value//[^A-Za-z0-9_.+-]/_}"
+    printf '%s' "${value:-man}"
+}
+
+function resolve_man_pages ()
+{
+    local title=$1
+    local section=${2:-}
+
+    [[ -n "$title" ]] || return 1
+
+    if [[ -n "$section" ]]; then
+        man -wa -- "$section" "$title" 2>/dev/null || true
+    else
+        man -wa -- "$title" 2>/dev/null || true
+    fi
+}
+
+function render_man_path ()
+{
+    local title=$1
+    local section=$2
+    local source_path=$3
+    local safe_title safe_section key file tmp
+
+    safe_title=$(safe_man_component "$title")
+    safe_section=$(safe_man_component "${section:-unknown}")
+    key=$(printf '%s' "$source_path" | cksum | awk '{ print $1 }')
+    file="$man_dir/${safe_title}.${safe_section}.${key}.txt"
+    tmp="$file.tmp.$$"
+
+    if [[ ! -s "$file" ]]; then
+        if man -l -- "$source_path" 2>/dev/null | col -b > "$tmp" && [[ -s "$tmp" ]]; then
+            mv "$tmp" "$file"
+        else
+            rm -f "$tmp"
+            return 1
+        fi
+    fi
+
+    printf '%s\n' "$file"
+}
+
+function source_paths ()
+{
+    local fd_type=$1
+    local kind=$2
+    local path
+
+    "$fd_path" -a -t "$fd_type" . "${libs[@]}" 2>/dev/null |
+        while IFS= read -r path; do
+            emit_candidate "$kind" "$path" 0 "" "$path"
+        done
+}
+
+function source_add_dirs ()
+{
+    local lib path rel display label
+    local multi=false
+
+    if [[ "${#libs[@]}" -gt 1 ]]; then
+        multi=true
+    fi
+
+    for lib in "${libs[@]}"; do
+        label=$(basename "$lib")
+        if "$multi"; then
+            emit_candidate "add_dir" "$lib" 0 "$lib" ".  [$label]"
+        else
+            emit_candidate "add_dir" "$lib" 0 "$lib" "."
+        fi
+
+        "$fd_path" -a -t d . "$lib" 2>/dev/null |
+            while IFS= read -r path; do
+                rel=$(relative_to_lib "$path" "$lib")
+                if "$multi"; then
+                    display="${rel}  [$label]"
+                else
+                    display="$rel"
+                fi
+                emit_candidate "add_dir" "$path" 0 "$lib" "$display"
+            done
+    done
+}
+
+function source_man_file ()
+{
+    local query=$1
+    local section title remainder source_path page_section file label display
+
+    IFS=$man_query_sep read -r section title remainder < <(split_man_query "$query") || return 0
+
+    while IFS= read -r source_path; do
+        [[ -n "$source_path" ]] || continue
+
+        page_section=$(man_section_from_path "$source_path")
+        page_section=${page_section:-$section}
+        file=$(render_man_path "$title" "$page_section" "$source_path") || continue
+        label=$(man_page_label "$title" "$page_section")
+
+        display="man:${label}"
+        if [[ -n "$remainder" ]]; then
+            display+=" ${remainder}"
+        fi
+        display+=" -> ${file}"
+
+        emit_candidate "man_file" "$file" 0 "$label" "$display"
+    done < <(resolve_man_pages "$title" "$section")
+}
+
+function run_rg ()
+{
+    local mode=$1
+    local pattern=$2
+    shift 2
+
+    [[ -n "$pattern" ]] || return 0
+
+    if [[ "$mode" == "content_lit" ]]; then
+        "$rg_path" --column --line-number --no-heading --color=never \
+            --ignore-case --fixed-strings \
+            --field-match-separator "$tab" \
+            --field-context-separator "$tab" \
+            -- "$pattern" "$@" 2>/dev/null || true
+    else
+        "$rg_path" --column --line-number --no-heading --color=never \
+            --ignore-case \
+            --field-match-separator "$tab" \
+            --field-context-separator "$tab" \
+            -- "$pattern" "$@" 2>/dev/null || true
+    fi
+}
+
+function source_content ()
+{
+    local mode=$1
+    local query=$2
+    local path line column text
+
+    run_rg "$mode" "$query" "${libs[@]}" |
+        while IFS=$'\t' read -r path line column text; do
+            [[ -n "${path:-}" && -n "${line:-}" ]] || continue
+            emit_candidate "content" "$path" "$line" "" "${path}:${line}:${column}:${text}"
+        done
+}
+
+function source_man_content ()
+{
+    local mode=$1
+    local query=$2
+    local section title remainder pattern source_path page_section file label path line column text
+
+    IFS=$man_query_sep read -r section title remainder < <(split_man_query "$query") || return 0
+    pattern=${remainder:-$title}
+
+    while IFS= read -r source_path; do
+        [[ -n "$source_path" ]] || continue
+
+        page_section=$(man_section_from_path "$source_path")
+        page_section=${page_section:-$section}
+        file=$(render_man_path "$title" "$page_section" "$source_path") || continue
+        label=$(man_page_label "$title" "$page_section")
+
+        run_rg "$mode" "$pattern" "$file" |
+            while IFS=$'\t' read -r path line column text; do
+                [[ -n "${line:-}" ]] || continue
+                emit_candidate "man_content" "$file" "$line" "$label" "man:${label}:${line}:${column}:${text}"
+            done
+    done < <(resolve_man_pages "$title" "$section")
+}
+
+function source_for ()
+{
+    local mode=$1
+    local query=$2
+
+    case "$mode" in
+        file)
+            source_man_file "$query"
+            source_paths f file
+            ;;
+        dir)
+            source_paths d dir
+            ;;
+        content_regex|content_lit)
+            source_content "$mode" "$query"
+            source_man_content "$mode" "$query"
+            ;;
+        filter)
+            cat "$frozen_file" 2>/dev/null || true
+            ;;
+        add)
+            source_add_dirs
+            ;;
+    esac
+}
+
+function source_current ()
+{
+    source_for "$(current_mode)" "${FZF_QUERY:-}"
+}
+
+function source_live ()
+{
+    source_for "$(current_mode)" "$(read_state "$live_query_file" "")"
+}
+
+function source_filter ()
+{
+    cat "$frozen_file" 2>/dev/null || true
+}
+
+function source_add ()
+{
+    source_add_dirs
+}
+
+function live_query ()
+{
+    read_state "$live_query_file" ""
+}
+
+function add_seed ()
+{
+    read_state "$add_seed_file" ""
+}
+
+function add_prev_query ()
+{
+    read_state "$add_prev_query_file" ""
+}
+
+function on_change ()
+{
+    if [[ "$(current_mode)" == "filter" || "$(current_mode)" == "add" ]]; then
+        printf 'ignore\n'
+    else
+        printf 'reload(%s source)\n' "$0"
+    fi
+}
+
+function file_mode_name ()
+{
+    read_state "$file_mode_file" "file"
+}
+
+function content_mode_name ()
+{
+    local content_mode
+
+    content_mode=$(read_state "$content_mode_file" "regex")
+    printf 'content_%s' "$content_mode"
+}
+
+function opposite_top_mode ()
+{
+    case "$1" in
+        file|dir) content_mode_name ;;
+        content_regex|content_lit) file_mode_name ;;
+        *) file_mode_name ;;
+    esac
+}
+
+function switch_top ()
+{
+    local mode new_mode
+
+    mode=$(current_mode)
+    if [[ "$mode" == "add" ]]; then
+        printf 'ignore\n'
+        return
+    fi
+
+    if [[ "$mode" == "filter" ]]; then
+        mode=$(read_state "$pre_filter_mode_file" "file")
+        new_mode=$(opposite_top_mode "$mode")
+        write_state "$mode_file" "$new_mode"
+        printf '%s+transform-query(%s live-query)+reload-sync(%s source-live)\n' \
+            "$(actions_for_mode "$new_mode")" "$0" "$0"
+        return
+    fi
+
+    new_mode=$(opposite_top_mode "$mode")
+    write_state "$mode_file" "$new_mode"
+    printf '%s+reload(%s source)\n' "$(actions_for_mode "$new_mode")" "$0"
+}
+
+function toggle_submode ()
+{
+    local mode new_mode
+
+    mode=$(current_mode)
+    case "$mode" in
+        file)
+            new_mode=dir
+            write_state "$file_mode_file" "$new_mode"
+            ;;
+        dir)
+            new_mode=file
+            write_state "$file_mode_file" "$new_mode"
+            ;;
+        content_regex)
+            new_mode=content_lit
+            write_state "$content_mode_file" "lit"
+            ;;
+        content_lit)
+            new_mode=content_regex
+            write_state "$content_mode_file" "regex"
+            ;;
+        filter|add)
+            printf 'ignore\n'
+            return
+            ;;
+        *)
+            new_mode=file
+            write_state "$file_mode_file" "$new_mode"
+            ;;
+    esac
+
+    write_state "$mode_file" "$new_mode"
+    printf '%s+reload(%s source)\n' "$(actions_for_mode "$new_mode")" "$0"
+}
+
+function freeze_results ()
+{
+    local mode=$1
+    local query=$2
+
+    if [[ "$mode" == "file" || "$mode" == "dir" ]]; then
+        source_for "$mode" "$query" |
+            FZF_DEFAULT_COMMAND= FZF_DEFAULT_OPTS= "$fzf_path" \
+                --filter "$query" \
+                --delimiter "$tab" \
+                --with-nth '5..' \
+                --ignore-case > "$frozen_file" || true
+    else
+        source_for "$mode" "$query" > "$frozen_file"
+    fi
+}
+
+function toggle_filter ()
+{
+    local mode query filter_prompt
+
+    mode=$(current_mode)
+    if [[ "$mode" == "add" ]]; then
+        printf 'ignore\n'
+        return
+    fi
+
+    if [[ "$mode" == "filter" ]]; then
+        mode=$(read_state "$pre_filter_mode_file" "file")
+        write_state "$mode_file" "$mode"
+        printf '%s+transform-query(%s live-query)+reload-sync(%s source-live)\n' \
+            "$(actions_for_mode "$mode")" "$0" "$0"
+        return
+    fi
+
+    query=${FZF_QUERY:-}
+    write_state "$pre_filter_mode_file" "$mode"
+    write_state "$live_query_file" "$query"
+    freeze_results "$mode" "$query"
+    write_state "$mode_file" "filter"
+
+    case "$mode" in
+        file|dir) filter_prompt=$(prompt_for filter_file) ;;
+        *) filter_prompt=$(prompt_for filter_content_regex) ;;
+    esac
+
+    printf 'reload-sync(%s source-filter)+change-prompt(%s)+enable-search+clear-query\n' \
+        "$0" "$filter_prompt"
+}
+
+function cancel_add ()
+{
+    local mode query filter_prompt pre_filter
+
+    mode=$(read_state "$add_prev_mode_file" "file")
+    query=$(read_state "$add_prev_query_file" "")
+    write_state "$mode_file" "$mode"
+
+    if [[ "$mode" == "filter" ]]; then
+        pre_filter=$(read_state "$pre_filter_mode_file" "file")
+        case "$pre_filter" in
+            file|dir) filter_prompt=$(prompt_for filter_file) ;;
+            *) filter_prompt=$(prompt_for filter_content_regex) ;;
+        esac
+        printf 'change-prompt(%s)+change-header(%s)+enable-search+transform-query(%s add-prev-query)+reload-sync(%s source-filter)\n' \
+            "$filter_prompt" "$(header_for "$mode")" "$0" "$0"
+        return
+    fi
+
+    printf '%s+transform-query(%s add-prev-query)+reload-sync(%s source)\n' \
+        "$(actions_for_mode "$mode")" "$0" "$0"
+}
+
+function toggle_add ()
+{
+    local item=${1:-}
+    local mode query seed path root
+
+    mode=$(current_mode)
+    if [[ "$mode" == "add" ]]; then
+        cancel_add
+        return
+    fi
+
+    if [[ "$mode" == "filter" ]]; then
+        query=$(live_query)
+    else
+        query=${FZF_QUERY:-}
+    fi
+    query=$(trim_string "$query")
+
+    if [[ -z "$query" ]]; then
+        query=$(selected_item_title "$item")
+        query=$(trim_string "$query")
+    fi
+
+    if [[ -z "$query" ]]; then
+        printf 'change-header(Ctrl-A needs a query or selected result)+bell\n'
+        return
+    fi
+
+    seed=$(selected_item_parent_seed "$item" || true)
+    if [[ -z "$seed" ]]; then
+        seed=$(first_query_word "$query" || true)
+    fi
+
+    path=$(selected_item_path "$item")
+    root=""
+    if [[ -n "$path" ]]; then
+        root=$(lib_for_path "$path" || true)
+    fi
+
+    write_state "$add_prev_mode_file" "$mode"
+    write_state "$add_prev_query_file" "${FZF_QUERY:-}"
+    write_state "$add_query_file" "$query"
+    write_state "$add_seed_file" "$seed"
+    write_state "$add_root_file" "$root"
+    write_state "$mode_file" "add"
+
+    printf '%s+transform-query(%s add-seed)+reload-sync(%s source-add)\n' \
+        "$(actions_for_mode add)" "$0" "$0"
+}
+
+function preview_item ()
+{
+    local item=$1
+    local kind path line title display
+
+    IFS=$'\t' read -r kind path line title display <<< "$item"
+    [[ -n "${path:-}" ]] || return 0
+
+    case "$kind" in
+        dir|add_dir)
+            if command -v tree >/dev/null 2>&1; then
+                tree -C "$path"
+            else
+                find "$path" -maxdepth 2 -print 2>/dev/null
+            fi
+            ;;
+        content|man_content)
+            "$bat_path" --color=always "$path" --highlight-line "${line:-1}" 2>/dev/null || true
+            ;;
+        file|man_file)
+            "$bat_path" --color=always "$path" 2>/dev/null || true
+            ;;
+    esac
+}
+
+function accept_add ()
+{
+    local item=$1
+    local picker_query=${FZF_QUERY:-}
+    local kind path line title display
+    local dest_dir root rel note query cursor_line
+
+    IFS=$'\t' read -r kind path line title display <<< "$item"
+    if [[ "${FZF_MATCH_COUNT:-1}" != "0" && "$kind" == "add_dir" && -n "${path:-}" ]]; then
+        dest_dir="$path"
+    else
+        rel=$(safe_relative_dir "$picker_query") || exit 1
+        root=$(choose_new_dir_root) || exit 1
+        dest_dir="$root/$rel"
+    fi
+
+    query=$(read_state "$add_query_file" "")
+    note=$(create_note "$dest_dir" "$query") || exit 1
+    cursor_line=$(note_body_line "$note")
+    exec $editor "$note" "+$cursor_line"
+}
+
+function accept_item ()
+{
+    local item=$1
+    local kind path line title display
+
+    if [[ "$(current_mode)" == "add" ]]; then
+        accept_add "$item"
+        exit $?
+    fi
+
+    IFS=$'\t' read -r kind path line title display <<< "$item"
+    [[ -n "${path:-}" ]] || exit 1
+
+    case "$kind" in
+        content|man_content)
+            if [[ "${line:-0}" =~ ^[0-9]+$ && "$line" -gt 0 ]]; then
+                exec $editor "$path" "+$line"
+            fi
+            exec $editor "$path"
+            ;;
+        file|dir|man_file)
+            exec $editor "$path"
+            ;;
+        *)
+            exit 1
+            ;;
+    esac
+}
+
+case "${1:-}" in
+    source) source_current ;;
+    source-live) source_live ;;
+    source-filter) source_filter ;;
+    source-add) source_add ;;
+    live-query) live_query ;;
+    add-seed) add_seed ;;
+    add-prev-query) add_prev_query ;;
+    on-change) on_change ;;
+    switch-top) switch_top ;;
+    toggle-submode) toggle_submode ;;
+    toggle-filter) toggle_filter ;;
+    toggle-add)
+        shift
+        toggle_add "${1:-}"
+        ;;
+    preview)
+        shift
+        preview_item "${1:-}"
+        ;;
+    accept)
+        shift
+        accept_item "${1:-}"
+        ;;
+esac
+NEITH_FZF_HELPER
+    chmod +x "$helper"
+
+    export NEITH_FZF_TMP="$tmp_dir"
+    export NEITH_FZF_LIBS_FILE="$libs_file"
+    export NEITH_FD_PATH
+    export NEITH_FZF_PATH
+    export NEITH_RG_PATH
+    export NEITH_BAT_PATH
+    export NEITH_NOTE_TEMPLATE
+
+    "$NEITH_FZF_PATH" --ansi --query "$INITIAL_QUERY" \
+        --prompt 'F:file> ' \
+        --header 'Tab: mode | Ctrl-T: toggle | Ctrl-F: filter | Ctrl-A: add | Enter: open | Esc: quit' \
+        --bind "start:reload-sync($helper source)" \
+        --bind "change:transform($helper on-change)" \
+        --bind "tab:transform($helper switch-top)" \
+        --bind "ctrl-t:transform($helper toggle-submode)" \
+        --bind "ctrl-f:transform($helper toggle-filter)" \
+        --bind "ctrl-a:transform($helper toggle-add {})" \
+        --bind "enter:become($helper accept {})" \
+        --bind 'esc:abort' \
         --color "hl:-1:underline,hl+:-1:underline:reverse" \
-        --prompt '[Ctrl+T to swap] 1. rg> ' \
-        --delimiter : \
-        --preview 'bat --color=always {1} --highlight-line {2}' \
-        --preview-window 'up,60%,border-bottom,+{2}+3/3,~3' \
-        --bind "enter:become($EDITOR {1} +{2})"
+        --delimiter $'\t' \
+        --with-nth '5..' \
+        --ignore-case \
+        --preview "$helper preview {}" \
+        --preview-window 'up,60%,border-bottom,+{3}+3/3,~3'
 fi
