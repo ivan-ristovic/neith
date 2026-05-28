@@ -21,7 +21,7 @@ SHORT_OPTS=h,v,p,a:
 LONG_OPTS=help,verbose,push,add:
 OPTS=$(getopt --alternative --name 'argument error' --options $SHORT_OPTS --longoptions $LONG_OPTS -- "$@") 
 if [ $? -ne 0 ]; then
-    std::fat "failed to parse provided arguments"
+    std_fat "failed to parse provided arguments"
 fi
 eval set -- $OPTS
 
@@ -51,7 +51,7 @@ do
             break
             ;;
         *)
-            log::err "unknown option: $1"
+            log_err "unknown option: $1"
             usage
             ;;
     esac
@@ -64,8 +64,8 @@ rc_locations=(
     $HOME/.neithrc
 )
 for f in "${rc_locations[@]}"; do
-    if io::is_file "$f"; then 
-        log::dbg "loading rc config: $f"
+    if io_is_file "$f"; then 
+        log_dbg "loading rc config: $f"
         source "$f"
     fi
 done
@@ -75,28 +75,48 @@ NEITH_FZF_PATH=${NEITH_FZF_PATH:-"fzf"}
 NEITH_RG_PATH=${NEITH_RG_PATH:-"rg"}
 NEITH_BAT_PATH=${NEITH_BAT_PATH:-"bat"}
 NEITH_NOTE_TEMPLATE=${NEITH_NOTE_TEMPLATE:-"$neith_dir/.neith-note-template.md"}
-assert::installed "$NEITH_FD_PATH"
-assert::installed "$NEITH_FZF_PATH"
-assert::installed "$NEITH_RG_PATH"
-assert::installed "$NEITH_BAT_PATH"
-assert::installed "man"
-assert::installed "col"
+NEITH_CACHE_DIR_NAME=${NEITH_CACHE_DIR_NAME:-".neith-cache"}
+NEITH_CACHE_REFRESH_SECONDS=${NEITH_CACHE_REFRESH_SECONDS:-"60"}
+assert_installed "$NEITH_FD_PATH"
+assert_installed "$NEITH_FZF_PATH"
+assert_installed "$NEITH_RG_PATH"
+assert_installed "$NEITH_BAT_PATH"
+assert_installed "man"
+assert_installed "col"
 
-log::dbg "NEITH_LIBS=$NEITH_LIBS"
+log_dbg "NEITH_LIBS=$NEITH_LIBS"
 
 # Parse lib folders
-if ! test::var_set NEITH_LIBS ; then
-    log::dbg "NEITH_LIBS not set, adding '$neith_dir' to libs"
+if ! test_var_set NEITH_LIBS ; then
+    log_dbg "NEITH_LIBS not set, adding '$neith_dir' to libs"
     NEITH_LIBS="$neith_dir"
 fi
-libs=$(str::split ":" "$NEITH_LIBS")
-libs=$(arr::uniq $libs)
+libs=$(str_split ":" "$NEITH_LIBS")
+libs=$(arr_uniq $libs)
 readarray -t libs <<<"$libs"
+
+function ensure_lib_cache ()
+{
+    local lib=$1
+    local cache_dir gitignore pattern
+
+    [ -d "$lib" ] || return 0
+
+    cache_dir="$lib/$NEITH_CACHE_DIR_NAME"
+    gitignore="$lib/.gitignore"
+    pattern="/$NEITH_CACHE_DIR_NAME/"
+
+    mkdir -p "$cache_dir" 2>/dev/null || return 1
+    touch "$gitignore" 2>/dev/null || return 1
+    if ! grep -qxF "$pattern" "$gitignore"; then
+        { printf '%s\n' "$pattern" >> "$gitignore"; } 2>/dev/null || return 1
+    fi
+}
 
 function choose_lib ()
 {
     local lib_count
-    lib_count=$(arr::size libs)
+    lib_count=$(arr_size libs)
     if [ "$lib_count" -gt 1 ]; then
         for i in "${!libs[@]}"; do 
             printf "%s: %s\n" "$i" "${libs[$i]}"
@@ -186,16 +206,16 @@ function create_note ()
     local title path tmp
 
     query=$(str_trim "$query")
-    [ -n "$query" ] || std::fat "note title/query must not be empty"
+    [ -n "$query" ] || std_fat "note title/query must not be empty"
 
-    mkdir -p "$dir" || std::fat "failed to create directory: $dir"
+    mkdir -p "$dir" || std_fat "failed to create directory: $dir"
     path=$(note_path_for "$dir" "$query")
 
     if [ ! -e "$path" ]; then
         title=$(title_from_query "$query")
         tmp="${path}.tmp.$$"
         render_note_template "$title" "$tmp"
-        mv "$tmp" "$path" || std::fat "failed to create note: $path"
+        mv "$tmp" "$path" || std_fat "failed to create note: $path"
     fi
 
     printf '%s' "$path"
@@ -204,22 +224,22 @@ function create_note ()
 # Add
 if [ -n "$NEITH_CMD_ADD" ]; then
     lib=$(choose_lib)
-    log::dbg "Selected lib: ${lib}"
-    path=$(os::path "$lib/$NEITH_CMD_ADD")
+    log_dbg "Selected lib: ${lib}"
+    path=$(os_path "$lib/$NEITH_CMD_ADD")
     if [ -n "${*:-}" ]; then
         path=$(create_note "$path" "${*:-}")
         line=$(note_body_line "$path")
-        log::exec "$EDITOR" "$path" "+$line"
+        log_exec "$EDITOR" "$path" "+$line"
     else
-        log::exec "$EDITOR" "$path"
+        log_exec "$EDITOR" "$path"
     fi
 fi
 
 # Push
 if "$NEITH_PUSH_LIB_UPDATE"; then
     lib=$(choose_lib)
-    log::dbg "Selected lib: ${lib}"
-    pushd "$lib" || std::fat "failed to enter dir: $lib"
+    log_dbg "Selected lib: ${lib}"
+    pushd "$lib" || std_fat "failed to enter dir: $lib"
     set -e
     git pull
     git add --all
@@ -239,7 +259,7 @@ if [ "$NEITH_CMD_SEARCH" == "true" ]; then
     printf '%s\n' "${libs[@]}" > "$libs_file"
     printf 'file' > "$tmp_dir/mode"
     printf 'file' > "$tmp_dir/file_mode"
-    printf 'regex' > "$tmp_dir/content_mode"
+    printf 'fuzzy' > "$tmp_dir/content_mode"
     printf '' > "$tmp_dir/live_query"
     printf '' > "$tmp_dir/pre_filter_mode"
     printf '' > "$tmp_dir/frozen"
@@ -248,6 +268,12 @@ if [ "$NEITH_CMD_SEARCH" == "true" ]; then
     printf '' > "$tmp_dir/add_query"
     printf '' > "$tmp_dir/add_seed"
     printf '' > "$tmp_dir/add_root"
+    printf '' > "$tmp_dir/file_source_key"
+    printf '' > "$tmp_dir/content_fuzzy_source_key"
+
+    for lib in "${libs[@]}"; do
+        ensure_lib_cache "$lib" || log_dbg "failed to prepare cache directory for lib: $lib"
+    done
 
     function cleanup_search ()
     {
@@ -266,6 +292,12 @@ fzf_path=${NEITH_FZF_PATH:-fzf}
 rg_path=${NEITH_RG_PATH:-rg}
 bat_path=${NEITH_BAT_PATH:-bat}
 note_template=${NEITH_NOTE_TEMPLATE:-}
+cache_dir_name=${NEITH_CACHE_DIR_NAME:-.neith-cache}
+cache_version="v1"
+cache_refresh_seconds=${NEITH_CACHE_REFRESH_SECONDS:-60}
+if [[ ! "$cache_refresh_seconds" =~ ^[0-9]+$ ]]; then
+    cache_refresh_seconds=60
+fi
 editor=${EDITOR:-vi}
 tab=$'\t'
 man_query_sep=$'\037'
@@ -283,6 +315,8 @@ add_prev_query_file="$tmp_dir/add_prev_query"
 add_query_file="$tmp_dir/add_query"
 add_seed_file="$tmp_dir/add_seed"
 add_root_file="$tmp_dir/add_root"
+file_source_key_file="$tmp_dir/file_source_key"
+content_fuzzy_source_key_file="$tmp_dir/content_fuzzy_source_key"
 man_dir="$tmp_dir/man"
 mkdir -p "$man_dir"
 
@@ -306,6 +340,179 @@ function write_state ()
     printf '%s' "$value" > "$file"
 }
 
+function cache_path_for ()
+{
+    local prefix=$1
+    local key=$2
+    local checksum
+
+    checksum=$(printf '%s' "$key" | cksum | awk '{ print $1 }')
+    printf '%s/%s.%s' "$tmp_dir" "$prefix" "$checksum"
+}
+
+function cache_once ()
+{
+    local cache=$1
+    local tmp
+
+    shift
+    if [[ ! -e "$cache" ]]; then
+        tmp="${cache}.tmp.$$"
+        if "$@" > "$tmp"; then
+            mv "$tmp" "$cache"
+        else
+            rm -f "$tmp"
+            return 1
+        fi
+    fi
+
+    cat "$cache"
+}
+
+function prepare_lib_cache ()
+{
+    local lib=$1
+    local cache_dir gitignore pattern
+
+    [[ -d "$lib" ]] || return 0
+
+    cache_dir="$lib/$cache_dir_name"
+    gitignore="$lib/.gitignore"
+    pattern="/$cache_dir_name/"
+
+    mkdir -p "$cache_dir" 2>/dev/null || return 1
+    touch "$gitignore" 2>/dev/null || return 1
+    if ! grep -qxF "$pattern" "$gitignore"; then
+        { printf '%s\n' "$pattern" >> "$gitignore"; } 2>/dev/null || return 1
+    fi
+}
+
+function lib_cache_path ()
+{
+    local lib=$1
+    local name=$2
+
+    printf '%s/%s/%s.%s' "$lib" "$cache_dir_name" "$cache_version" "$name"
+}
+
+function cache_age_seconds ()
+{
+    local cache=$1
+    local now mtime
+
+    [[ -e "$cache" ]] || return 1
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$cache" 2>/dev/null) || return 1
+    printf '%s' "$((now - mtime))"
+}
+
+function build_lib_cache ()
+{
+    local lib=$1
+    local name=$2
+    local builder=$3
+    local cache tmp
+
+    shift 3
+    if ! prepare_lib_cache "$lib"; then
+        "$builder" "$lib" "$@"
+        return
+    fi
+
+    cache=$(lib_cache_path "$lib" "$name")
+    tmp="${cache}.tmp.$$"
+    if "$builder" "$lib" "$@" > "$tmp"; then
+        mv "$tmp" "$cache"
+        cat "$cache"
+    else
+        rm -f "$tmp"
+        "$builder" "$lib" "$@"
+    fi
+}
+
+function lib_cache_once ()
+{
+    local lib=$1
+    local name=$2
+    local builder=$3
+    local cache
+
+    shift 3
+    if ! prepare_lib_cache "$lib"; then
+        "$builder" "$lib" "$@"
+        return
+    fi
+
+    cache=$(lib_cache_path "$lib" "$name")
+    if [[ ! -e "$cache" ]]; then
+        build_lib_cache "$lib" "$name" "$builder" "$@"
+        return
+    fi
+
+    cat "$cache"
+}
+
+function refresh_lib_cache_if_stale ()
+{
+    local lib=$1
+    local name=$2
+    local builder=$3
+    local cache age
+
+    shift 3
+    prepare_lib_cache "$lib" || return 0
+
+    cache=$(lib_cache_path "$lib" "$name")
+    age=$(cache_age_seconds "$cache" || printf '%s' "$((cache_refresh_seconds + 1))")
+    if [[ "$age" -ge "$cache_refresh_seconds" ]]; then
+        build_lib_cache "$lib" "$name" "$builder" "$@" >/dev/null
+    fi
+}
+
+function refresh_lib_caches ()
+{
+    local lib=$1
+
+    refresh_lib_cache_if_stale "$lib" "paths-f" build_lib_paths f file
+    refresh_lib_cache_if_stale "$lib" "paths-d" build_lib_paths d dir
+    refresh_lib_cache_if_stale "$lib" "add-dirs" build_lib_dirs_raw
+    refresh_lib_cache_if_stale "$lib" "content-fuzzy" build_lib_content_fuzzy
+}
+
+function refresh_caches ()
+{
+    local lib
+
+    for lib in "${libs[@]}"; do
+        refresh_lib_caches "$lib"
+    done
+}
+
+function rebuild_lib_caches ()
+{
+    local lib=$1
+
+    build_lib_cache "$lib" "paths-f" build_lib_paths f file >/dev/null
+    build_lib_cache "$lib" "paths-d" build_lib_paths d dir >/dev/null
+    build_lib_cache "$lib" "add-dirs" build_lib_dirs_raw >/dev/null
+    build_lib_cache "$lib" "content-fuzzy" build_lib_content_fuzzy >/dev/null
+}
+
+function rebuild_caches ()
+{
+    local lib
+
+    for lib in "${libs[@]}"; do
+        rebuild_lib_caches "$lib"
+    done
+}
+
+function rebuild_caches_and_source ()
+{
+    rebuild_caches
+    source_current
+}
+
 function current_mode ()
 {
     read_state "$mode_file" "file"
@@ -316,10 +523,10 @@ function prompt_for ()
     case "$1" in
         file) printf 'F:file> ' ;;
         dir) printf 'F:dir> ' ;;
-        content_regex) printf 'C:regex> ' ;;
+        content_fuzzy) printf 'C:fuzzy> ' ;;
         content_lit) printf 'C:lit> ' ;;
         filter_file|filter_dir) printf 'F:filter> ' ;;
-        filter_content_regex|filter_content_lit) printf 'C:filter> ' ;;
+        filter_content_fuzzy|filter_content_lit) printf 'C:filter> ' ;;
         add) printf 'A:dir> ' ;;
         *) printf 'F:file> ' ;;
     esac
@@ -328,7 +535,7 @@ function prompt_for ()
 function search_action_for ()
 {
     case "$1" in
-        content_regex|content_lit) printf 'disable-search' ;;
+        content_lit) printf 'disable-search' ;;
         *) printf 'enable-search' ;;
     esac
 }
@@ -337,7 +544,7 @@ function header_for ()
 {
     case "$1" in
         add) printf 'Enter: select/create | Ctrl-A: cancel | Esc: quit' ;;
-        *) printf 'Tab: mode | Ctrl-T: toggle | Ctrl-F: filter | Ctrl-A: add | Enter: open | Esc: quit' ;;
+        *) printf 'Tab: mode | Ctrl-T: toggle | Ctrl-F: filter | Ctrl-R: refresh | Ctrl-A: add | Enter: open | Esc: quit' ;;
     esac
 }
 
@@ -358,6 +565,19 @@ function emit_candidate ()
     local display=$5
 
     printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$path" "$line" "$title" "$display"
+}
+
+function emit_content_candidate ()
+{
+    local kind=$1
+    local path=$2
+    local line=$3
+    local title=$4
+    local text=$5
+    local context=$6
+
+    text=${text//$'\t'/    }
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$kind" "$path" "$line" "$title" "$text" "$context"
 }
 
 function trim_string ()
@@ -695,54 +915,80 @@ function render_man_path ()
     printf '%s\n' "$file"
 }
 
-function source_paths ()
+function build_lib_paths ()
 {
-    local fd_type=$1
-    local kind=$2
+    local lib=$1
+    local fd_type=$2
+    local kind=$3
     local path
 
-    "$fd_path" -a -t "$fd_type" . "${libs[@]}" 2>/dev/null |
+    "$fd_path" -a -t "$fd_type" --exclude "$cache_dir_name" . "$lib" 2>/dev/null |
         while IFS= read -r path; do
             emit_candidate "$kind" "$path" 0 "" "$path"
         done
 }
 
-function source_add_dirs ()
+function source_paths ()
 {
-    local lib path rel display label
+    local fd_type=$1
+    local kind=$2
+    local lib
+
+    for lib in "${libs[@]}"; do
+        lib_cache_once "$lib" "paths-${fd_type}" build_lib_paths "$fd_type" "$kind"
+    done
+}
+
+function build_lib_dirs_raw ()
+{
+    local lib=$1
+    local path
+
+    emit_candidate "add_dir" "$lib" 0 "$lib" "."
+    "$fd_path" -a -t d --exclude "$cache_dir_name" . "$lib" 2>/dev/null |
+        while IFS= read -r path; do
+            emit_candidate "add_dir" "$path" 0 "$lib" "$(relative_to_lib "$path" "$lib")"
+        done
+}
+
+function source_lib_add_dirs ()
+{
+    local lib=$1
+    local label kind path line title display rel
     local multi=false
 
     if [[ "${#libs[@]}" -gt 1 ]]; then
         multi=true
     fi
 
-    for lib in "${libs[@]}"; do
-        label=$(basename "$lib")
-        if "$multi"; then
-            emit_candidate "add_dir" "$lib" 0 "$lib" ".  [$label]"
-        else
-            emit_candidate "add_dir" "$lib" 0 "$lib" "."
-        fi
+    label=$(basename "$lib")
+    lib_cache_once "$lib" "add-dirs" build_lib_dirs_raw |
+        while IFS=$'\t' read -r kind path line title display; do
+            [[ -n "${path:-}" ]] || continue
+            rel=${display:-.}
+            if "$multi"; then
+                display="${rel}  [$label]"
+            else
+                display="$rel"
+            fi
+            emit_candidate "add_dir" "$path" 0 "$title" "$display"
+        done
+}
 
-        "$fd_path" -a -t d . "$lib" 2>/dev/null |
-            while IFS= read -r path; do
-                rel=$(relative_to_lib "$path" "$lib")
-                if "$multi"; then
-                    display="${rel}  [$label]"
-                else
-                    display="$rel"
-                fi
-                emit_candidate "add_dir" "$path" 0 "$lib" "$display"
-            done
+function source_add_dirs ()
+{
+    local lib
+
+    for lib in "${libs[@]}"; do
+        source_lib_add_dirs "$lib"
     done
 }
 
-function source_man_file ()
+function build_man_pages ()
 {
-    local query=$1
-    local section title remainder source_path page_section file label display
-
-    IFS=$man_query_sep read -r section title remainder < <(split_man_query "$query") || return 0
+    local title=$1
+    local section=$2
+    local source_path page_section file label
 
     while IFS= read -r source_path; do
         [[ -n "$source_path" ]] || continue
@@ -752,6 +998,30 @@ function source_man_file ()
         file=$(render_man_path "$title" "$page_section" "$source_path") || continue
         label=$(man_page_label "$title" "$page_section")
 
+        printf '%s\t%s\n' "$file" "$label"
+    done < <(resolve_man_pages "$title" "$section")
+}
+
+function source_man_pages ()
+{
+    local title=$1
+    local section=$2
+    local cache
+
+    cache=$(cache_path_for "man_pages" "$section:$title")
+    cache_once "$cache" build_man_pages "$title" "$section"
+}
+
+function source_man_file ()
+{
+    local query=$1
+    local section title remainder file label display
+
+    IFS=$man_query_sep read -r section title remainder < <(split_man_query "$query") || return 0
+
+    while IFS=$'\t' read -r file label; do
+        [[ -n "$file" && -n "$label" ]] || continue
+
         display="man:${label}"
         if [[ -n "$remainder" ]]; then
             display+=" ${remainder}"
@@ -759,7 +1029,7 @@ function source_man_file ()
         display+=" -> ${file}"
 
         emit_candidate "man_file" "$file" 0 "$label" "$display"
-    done < <(resolve_man_pages "$title" "$section")
+    done < <(source_man_pages "$title" "$section")
 }
 
 function run_rg ()
@@ -772,13 +1042,17 @@ function run_rg ()
 
     if [[ "$mode" == "content_lit" ]]; then
         "$rg_path" --column --line-number --no-heading --color=never \
+            --with-filename \
             --ignore-case --fixed-strings \
+            --glob "!**/$cache_dir_name/**" \
             --field-match-separator "$tab" \
             --field-context-separator "$tab" \
             -- "$pattern" "$@" 2>/dev/null || true
     else
         "$rg_path" --column --line-number --no-heading --color=never \
+            --with-filename \
             --ignore-case \
+            --glob "!**/$cache_dir_name/**" \
             --field-match-separator "$tab" \
             --field-context-separator "$tab" \
             -- "$pattern" "$@" 2>/dev/null || true
@@ -789,38 +1063,133 @@ function source_content ()
 {
     local mode=$1
     local query=$2
+
+    case "$mode" in
+        content_fuzzy)
+            source_content_fuzzy
+            ;;
+        content_lit)
+            source_content_lit "$query"
+            ;;
+    esac
+}
+
+function build_lib_content_fuzzy ()
+{
+    local lib=$1
     local path line column text
 
-    run_rg "$mode" "$query" "${libs[@]}" |
-        while IFS=$'\t' read -r path line column text; do
-            [[ -n "${path:-}" && -n "${line:-}" ]] || continue
-            emit_candidate "content" "$path" "$line" "" "${path}:${line}:${column}:${text}"
-        done
+    {
+        "$rg_path" --column --line-number --no-heading --color=never \
+            --with-filename \
+            --glob "!**/$cache_dir_name/**" \
+            --field-match-separator "$tab" \
+            --field-context-separator "$tab" \
+            -- "" "$lib" 2>/dev/null || true
+    } |
+    while IFS=$'\t' read -r path line column text; do
+        [[ -n "${path:-}" && -n "${line:-}" ]] || continue
+        emit_content_candidate "content" "$path" "$line" "" "$text" "${path}:${line}:${column}"
+    done
+}
+
+function source_content_fuzzy ()
+{
+    local lib
+
+    for lib in "${libs[@]}"; do
+        lib_cache_once "$lib" "content-fuzzy" build_lib_content_fuzzy
+    done
+}
+
+function source_content_lit ()
+{
+    local query=$1
+    local path line column text
+
+    run_rg "content_lit" "$query" "${libs[@]}" |
+    while IFS=$'\t' read -r path line column text; do
+        [[ -n "${path:-}" && -n "${line:-}" ]] || continue
+        emit_content_candidate "content" "$path" "$line" "" "$text" "${path}:${line}:${column}"
+    done
+}
+
+function man_pages_key_suffix ()
+{
+    local title=$1
+    local section=$2
+    local pages
+
+    pages=$(source_man_pages "$title" "$section")
+    [[ -n "$pages" ]] || return 0
+    printf '%s%s%s' "$section" "$man_query_sep" "$title"
+}
+
+function file_source_key ()
+{
+    local query=$1
+    local section title remainder key
+
+    IFS=$man_query_sep read -r section title remainder < <(split_man_query "$query") || return 0
+    key=$(man_pages_key_suffix "$title" "$section")
+    [[ -n "$key" ]] || return 0
+    printf '%s%s%s' "$key" "$man_query_sep" "$remainder"
+}
+
+function content_fuzzy_source_key ()
+{
+    local query=$1
+    local section title remainder
+
+    IFS=$man_query_sep read -r section title remainder < <(split_man_query "$query") || return 0
+    man_pages_key_suffix "$title" "$section"
 }
 
 function source_man_content ()
 {
     local mode=$1
     local query=$2
-    local section title remainder pattern source_path page_section file label path line column text
+    local section title remainder pattern file label path line column text
 
     IFS=$man_query_sep read -r section title remainder < <(split_man_query "$query") || return 0
     pattern=${remainder:-$title}
 
-    while IFS= read -r source_path; do
-        [[ -n "$source_path" ]] || continue
+    while IFS=$'\t' read -r file label; do
+        [[ -n "$file" && -n "$label" ]] || continue
 
-        page_section=$(man_section_from_path "$source_path")
-        page_section=${page_section:-$section}
-        file=$(render_man_path "$title" "$page_section" "$source_path") || continue
-        label=$(man_page_label "$title" "$page_section")
+        case "$mode" in
+            content_fuzzy)
+                cache_once "$(cache_path_for "man_content_fuzzy" "$section:$title:$file")" \
+                    source_man_content_fuzzy_uncached "$file" "$label"
+                ;;
+            content_lit)
+                run_rg "$mode" "$pattern" "$file" |
+                    while IFS=$'\t' read -r path line column text; do
+                        [[ -n "${line:-}" ]] || continue
+                        emit_content_candidate "man_content" "$file" "$line" "$label" "man:${label}: ${text}" "${line}:${column}"
+                    done
+                ;;
+        esac
+    done < <(source_man_pages "$title" "$section")
+}
 
-        run_rg "$mode" "$pattern" "$file" |
-            while IFS=$'\t' read -r path line column text; do
-                [[ -n "${line:-}" ]] || continue
-                emit_candidate "man_content" "$file" "$line" "$label" "man:${label}:${line}:${column}:${text}"
-            done
-    done < <(resolve_man_pages "$title" "$section")
+function source_man_content_fuzzy_uncached ()
+{
+    local file=$1
+    local label=$2
+    local path line column text
+
+    {
+        "$rg_path" --column --line-number --no-heading --color=never \
+            --with-filename \
+            --field-match-separator "$tab" \
+            --field-context-separator "$tab" \
+            -- "" "$file" 2>/dev/null || true
+    } |
+        while IFS=$'\t' read -r path line column text; do
+            [[ -n "${line:-}" ]] || continue
+            emit_content_candidate "man_content" "$file" "$line" "$label" "man:${label}: ${text}" "${line}:${column}"
+        done
 }
 
 function source_for ()
@@ -830,13 +1199,17 @@ function source_for ()
 
     case "$mode" in
         file)
+            write_state "$file_source_key_file" "$(file_source_key "$query")"
             source_man_file "$query"
             source_paths f file
             ;;
         dir)
             source_paths d dir
             ;;
-        content_regex|content_lit)
+        content_fuzzy|content_lit)
+            if [[ "$mode" == "content_fuzzy" ]]; then
+                write_state "$content_fuzzy_source_key_file" "$(content_fuzzy_source_key "$query")"
+            fi
             source_content "$mode" "$query"
             source_man_content "$mode" "$query"
             ;;
@@ -886,11 +1259,37 @@ function add_prev_query ()
 
 function on_change ()
 {
-    if [[ "$(current_mode)" == "filter" || "$(current_mode)" == "add" ]]; then
-        printf 'ignore\n'
-    else
-        printf 'reload(%s source)\n' "$0"
-    fi
+    local mode query key last_key
+
+    mode=$(current_mode)
+    case "$mode" in
+        filter|add|dir)
+            printf 'ignore\n'
+            ;;
+        file)
+            query=${FZF_QUERY:-}
+            key=$(file_source_key "$query")
+            last_key=$(read_state "$file_source_key_file" "")
+            if [[ "$key" == "$last_key" ]]; then
+                printf 'ignore\n'
+            else
+                printf 'reload(%s source)\n' "$0"
+            fi
+            ;;
+        content_fuzzy)
+            query=${FZF_QUERY:-}
+            key=$(content_fuzzy_source_key "$query")
+            last_key=$(read_state "$content_fuzzy_source_key_file" "")
+            if [[ "$key" == "$last_key" ]]; then
+                printf 'ignore\n'
+            else
+                printf 'reload(%s source)\n' "$0"
+            fi
+            ;;
+        *)
+            printf 'reload(%s source)\n' "$0"
+            ;;
+    esac
 }
 
 function file_mode_name ()
@@ -902,7 +1301,7 @@ function content_mode_name ()
 {
     local content_mode
 
-    content_mode=$(read_state "$content_mode_file" "regex")
+    content_mode=$(read_state "$content_mode_file" "fuzzy")
     printf 'content_%s' "$content_mode"
 }
 
@@ -910,7 +1309,7 @@ function opposite_top_mode ()
 {
     case "$1" in
         file|dir) content_mode_name ;;
-        content_regex|content_lit) file_mode_name ;;
+        content_fuzzy|content_lit) file_mode_name ;;
         *) file_mode_name ;;
     esac
 }
@@ -953,13 +1352,13 @@ function toggle_submode ()
             new_mode=file
             write_state "$file_mode_file" "$new_mode"
             ;;
-        content_regex)
+        content_fuzzy)
             new_mode=content_lit
             write_state "$content_mode_file" "lit"
             ;;
         content_lit)
-            new_mode=content_regex
-            write_state "$content_mode_file" "regex"
+            new_mode=content_fuzzy
+            write_state "$content_mode_file" "fuzzy"
             ;;
         filter|add)
             printf 'ignore\n'
@@ -980,12 +1379,13 @@ function freeze_results ()
     local mode=$1
     local query=$2
 
-    if [[ "$mode" == "file" || "$mode" == "dir" ]]; then
+    if [[ "$mode" == "file" || "$mode" == "dir" || "$mode" == "content_fuzzy" ]]; then
         source_for "$mode" "$query" |
             FZF_DEFAULT_COMMAND= FZF_DEFAULT_OPTS= "$fzf_path" \
                 --filter "$query" \
                 --delimiter "$tab" \
                 --with-nth '5..' \
+                --nth '1' \
                 --ignore-case > "$frozen_file" || true
     else
         source_for "$mode" "$query" > "$frozen_file"
@@ -1018,7 +1418,7 @@ function toggle_filter ()
 
     case "$mode" in
         file|dir) filter_prompt=$(prompt_for filter_file) ;;
-        *) filter_prompt=$(prompt_for filter_content_regex) ;;
+        *) filter_prompt=$(prompt_for filter_content_fuzzy) ;;
     esac
 
     printf 'reload-sync(%s source-filter)+change-prompt(%s)+enable-search+clear-query\n' \
@@ -1037,7 +1437,7 @@ function cancel_add ()
         pre_filter=$(read_state "$pre_filter_mode_file" "file")
         case "$pre_filter" in
             file|dir) filter_prompt=$(prompt_for filter_file) ;;
-            *) filter_prompt=$(prompt_for filter_content_regex) ;;
+            *) filter_prompt=$(prompt_for filter_content_fuzzy) ;;
         esac
         printf 'change-prompt(%s)+change-header(%s)+enable-search+transform-query(%s add-prev-query)+reload-sync(%s source-filter)\n' \
             "$filter_prompt" "$(header_for "$mode")" "$0" "$0"
@@ -1111,7 +1511,7 @@ function preview_item ()
             if command -v tree >/dev/null 2>&1; then
                 tree -C "$path"
             else
-                find "$path" -maxdepth 2 -print 2>/dev/null
+                find "$path" -maxdepth 2 -name "$cache_dir_name" -prune -o -print 2>/dev/null
             fi
             ;;
         content|man_content)
@@ -1179,6 +1579,8 @@ case "${1:-}" in
     source-live) source_live ;;
     source-filter) source_filter ;;
     source-add) source_add ;;
+    refresh-caches) refresh_caches ;;
+    rebuild-source) rebuild_caches_and_source ;;
     live-query) live_query ;;
     add-seed) add_seed ;;
     add-prev-query) add_prev_query ;;
@@ -1209,21 +1611,27 @@ NEITH_FZF_HELPER
     export NEITH_RG_PATH
     export NEITH_BAT_PATH
     export NEITH_NOTE_TEMPLATE
+    export NEITH_CACHE_DIR_NAME
+    export NEITH_CACHE_REFRESH_SECONDS
+
+    "$helper" refresh-caches >/dev/null 2>&1 &
 
     "$NEITH_FZF_PATH" --ansi --query "$INITIAL_QUERY" \
         --prompt 'F:file> ' \
-        --header 'Tab: mode | Ctrl-T: toggle | Ctrl-F: filter | Ctrl-A: add | Enter: open | Esc: quit' \
+        --header 'Tab: mode | Ctrl-T: toggle | Ctrl-F: filter | Ctrl-R: refresh | Ctrl-A: add | Enter: open | Esc: quit' \
         --bind "start:reload-sync($helper source)" \
         --bind "change:transform($helper on-change)" \
         --bind "tab:transform($helper switch-top)" \
         --bind "ctrl-t:transform($helper toggle-submode)" \
         --bind "ctrl-f:transform($helper toggle-filter)" \
+        --bind "ctrl-r:reload-sync($helper rebuild-source)" \
         --bind "ctrl-a:transform($helper toggle-add {})" \
         --bind "enter:become($helper accept {})" \
         --bind 'esc:abort' \
         --color "hl:-1:underline,hl+:-1:underline:reverse" \
         --delimiter $'\t' \
         --with-nth '5..' \
+        --nth '1' \
         --ignore-case \
         --preview "$helper preview {}" \
         --preview-window 'up,60%,border-bottom,+{3}+3/3,~3'

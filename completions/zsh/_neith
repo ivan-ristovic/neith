@@ -1,0 +1,73 @@
+#compdef neith
+
+_neith_resolve_command() {
+  local cmd=$1
+
+  if (( $+commands[readlink] )); then
+    readlink -f "$cmd" 2>/dev/null && return
+  fi
+
+  print -r -- "$cmd"
+}
+
+_neith_default_lib() {
+  local cmd target
+
+  cmd=$commands[neith]
+  [[ -n "$cmd" ]] || return 1
+  target=$(_neith_resolve_command "$cmd")
+  print -r -- "${target:h}"
+}
+
+_neith_list_libs() {
+  local lib default_lib
+  local -a libs
+
+  if [[ -n "${NEITH_LIBS:-}" ]]; then
+    libs=("${(@s.:.)NEITH_LIBS}")
+    for lib in "${libs[@]}"; do
+      [[ -n "$lib" ]] && print -r -- "$lib"
+    done
+    return
+  fi
+
+  default_lib=$(_neith_default_lib) || return
+  print -r -- "$default_lib"
+}
+
+_neith_list_categories() {
+  local lib dir rel
+
+  _neith_list_libs | while IFS= read -r lib; do
+    [[ -d "$lib" ]] || continue
+    find "$lib" -mindepth 1 -type d \
+      ! -name '.neith-cache' \
+      ! -path '*/.*' \
+      -print 2>/dev/null | while IFS= read -r dir; do
+        rel=${dir#"$lib"/}
+        [[ -n "$rel" ]] && print -r -- "$rel"
+      done
+  done | sort -u
+}
+
+_neith_categories() {
+  local -a categories
+
+  categories=("${(@f)$(_neith_list_categories)}")
+  _describe -t categories 'category' categories
+}
+
+_neith_query() {
+  _message -e query 'query terms'
+}
+
+_neith() {
+  _arguments -s -S \
+    '(-h --help)'{-h,--help}'[show help]' \
+    '(-v --verbose)'{-v,--verbose}'[enable verbose logging]' \
+    '(-p --push)'{-p,--push}'[pull, commit, and push selected library]' \
+    '(-a --add)'{-a,--add}'[create or open a note under category]:category:_neith_categories' \
+    '*::query:_neith_query'
+}
+
+_neith "$@"

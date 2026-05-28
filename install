@@ -1,9 +1,23 @@
 #!/bin/bash
 
-set -xe;
+set -xe
 
-sudo ln -s "$PWD/neith" /usr/local/bin/
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+sudo install -d /usr/local/bin
+sudo ln -sfn "$script_dir/neith" /usr/local/bin/neith
 
 # shlib
-git submodule init shlib
-sudo ln -s "$PWD/shlib/" /usr/local/bin/
+git -C "$script_dir" submodule init shlib
+sudo ln -sfn "$script_dir/shlib" /usr/local/bin/shlib
+
+# shell completions
+if [ -f "$script_dir/completions/bash/neith" ]; then
+    sudo install -d /usr/share/bash-completion/completions
+    sudo ln -sfn "$script_dir/completions/bash/neith" /usr/share/bash-completion/completions/neith
+fi
+
+if [ -f "$script_dir/completions/zsh/_neith" ]; then
+    sudo install -d /usr/local/share/zsh/site-functions
+    sudo ln -sfn "$script_dir/completions/zsh/_neith" /usr/local/share/zsh/site-functions/_neith
+fi

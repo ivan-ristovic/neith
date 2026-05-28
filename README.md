@@ -18,10 +18,10 @@ Selecting the result opens it in the chosen `$EDITOR` (for me, neovim), so you c
 
 `Ctrl+T` toggles `F:file>` and `F:dir>` while staying in the same window. In `F:file>`, Neith also checks the first word of the query as a man-page title. If it resolves, Neith renders every matching man page to temporary text files and includes those files in the search results, so a symbol such as `printf` can show both `printf(1)` and `printf(3)` when both are installed.
 
-Press `Tab` to switch between path search and content search. Content search starts in `C:regex>` and uses case-insensitive `rg` regex matching. `Ctrl+T` toggles `C:regex>` and `C:lit>`, where `C:lit>` uses fixed-string matching. `Esc` closes Neith.
+Press `Tab` to switch between path search and content search. Content search starts in `C:fuzzy>` and uses case-insensitive fzf matching over file-content lines. `Ctrl+T` toggles `C:fuzzy>` and `C:lit>`, where `C:lit>` uses exact fixed-string matching through `rg`. `Esc` closes Neith.
 ![](images/example-next.png)
 
-In content mode, man-page search uses the first word as the man-page title and searches the remaining query text inside all matching rendered man pages. If there is no remaining text, it searches for the title. To restrict to one manual section, use `name(section)` or `section name`, for example `printf(3) format` or `3 printf format`.
+In content mode, man-page search uses the first word as the man-page title and includes lines from all matching rendered man pages. In `C:fuzzy>`, fzf filters those lines with the current query. In `C:lit>`, Neith searches the remaining query text inside the rendered man pages; if there is no remaining text, it searches for the title. To restrict to one manual section, use `name(section)` or `section name`, for example `printf(3) format` or `3 printf format`.
 
 If there are many results, press `Ctrl+F` to freeze the current results and start a fresh fuzzy filter with an empty query. Press `Ctrl+F` again to restore the previous live query and mode.
 For example, searching for `unix` in content search mode:
@@ -43,7 +43,8 @@ Dependencies:
 - `shlib` - my custom shell scripting library bundled in this repository
 
 Installation:
-- Run the `setup` script
+- Run the `install` script
+- The installer links `neith`, `shlib`, and Bash/Zsh completions into system paths
 - Check if everything worked by invoking `neith`
 
 Setting the library:
