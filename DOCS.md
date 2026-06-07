@@ -603,6 +603,7 @@ Key behavior:
 | --- | --- |
 | `Tab` | Switch results and preview focus; close popups. |
 | `Ctrl-K` | Toggle fuzzy/exact query mode. |
+| `Ctrl-R` | Toggle fuzzy refine over the current result list. |
 | `Ctrl-T` | Cycle result filters: `all`, `names`, `content`, `man`. |
 | `Ctrl-L` | Cycle pinned libraries, then open the library picker. |
 | `Ctrl-H` | Open or close help. |
@@ -617,6 +618,14 @@ Key behavior:
 | `PageUp/PageDown` | Move the preview cursor by a page. |
 | Typing in results | Insert query text and refresh results. |
 | `Backspace` in results | Delete the previous query character and refresh results. |
+
+`Ctrl-R` result refine mode captures the currently displayed result list and the
+current query. It clears the prompt for a refine query, then uses
+`nucleo_matcher` to fuzzy-match that refine query against each captured result's
+display line, title, and snippet. An empty refine query shows all captured
+results. Pressing `Ctrl-R` again restores the captured query and result list.
+Changing query mode, source filter, or library scope while refine mode is active
+refreshes the captured base results and reapplies the refine query.
 
 ### Editor Flow
 

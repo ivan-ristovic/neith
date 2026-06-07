@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config as FuzzyConfig, Matcher, Utf32Str};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -40,6 +42,13 @@ struct EditorRequest {
     line: Option<usize>,
 }
 
+#[derive(Clone, Debug)]
+struct ResultRefineState {
+    base_query: String,
+    base_query_cursor: usize,
+    base_results: Vec<SearchResult>,
+}
+
 pub struct App {
     config: RuntimeConfig,
     engine: SearchEngine,
@@ -56,6 +65,7 @@ pub struct App {
     library_scopes: Vec<LibraryScope>,
     library_index: usize,
     library_selector_index: usize,
+    result_refine: Option<ResultRefineState>,
     pending_editor: Option<EditorRequest>,
     should_quit: bool,
 }
@@ -84,6 +94,7 @@ impl App {
             library_scopes,
             library_index: 0,
             library_selector_index: 0,
+            result_refine: None,
             pending_editor: None,
             should_quit: false,
         };
@@ -99,6 +110,14 @@ impl App {
     }
 
     fn refresh_results(&mut self) {
+        if self.result_refine.is_some() {
+            self.refresh_refined_results();
+            return;
+        }
+        self.refresh_indexed_results();
+    }
+
+    fn refresh_indexed_results(&mut self) {
         self.clamp_query_cursor();
         let request = SearchRequest {
             query: self.query.clone(),
@@ -108,6 +127,38 @@ impl App {
             limit: 80,
         };
         self.results = self.engine.search(&request);
+        self.finish_result_refresh();
+    }
+
+    fn refresh_refine_base_results(&mut self) {
+        let Some(state) = &self.result_refine else {
+            self.refresh_indexed_results();
+            return;
+        };
+        let request = SearchRequest {
+            query: state.base_query.clone(),
+            filter: self.filter,
+            mode: self.mode,
+            library: self.current_library_scope(),
+            limit: 80,
+        };
+        let base_results = self.engine.search(&request);
+        if let Some(state) = &mut self.result_refine {
+            state.base_results = base_results;
+        }
+        self.refresh_refined_results();
+    }
+
+    fn refresh_refined_results(&mut self) {
+        self.clamp_query_cursor();
+        let Some(state) = &self.result_refine else {
+            return;
+        };
+        self.results = fuzzy_refine_results(&state.base_results, &self.query);
+        self.finish_result_refresh();
+    }
+
+    fn finish_result_refresh(&mut self) {
         if self.selected >= self.results.len() {
             self.selected = self.results.len().saturating_sub(1);
         }
@@ -188,7 +239,7 @@ impl App {
         }
         if self.library_index + 1 < self.library_scopes.len() {
             self.library_index += 1;
-            self.refresh_results();
+            self.refresh_after_search_context_change();
         } else {
             self.focus = Focus::LibrarySelector;
             self.library_selector_index = 0;
@@ -215,7 +266,7 @@ impl App {
             self.library_index = self.library_scopes.len() - 1;
         }
         self.focus = Focus::Results;
-        self.refresh_results();
+        self.refresh_after_search_context_change();
     }
 
     fn library_selector_len(&self) -> usize {
@@ -282,6 +333,39 @@ impl App {
             MatchMode::Fuzzy => MatchMode::Exact,
             MatchMode::Exact => MatchMode::Fuzzy,
         };
+        self.refresh_after_search_context_change();
+    }
+
+    fn refresh_after_search_context_change(&mut self) {
+        if self.result_refine.is_some() {
+            self.refresh_refine_base_results();
+        } else {
+            self.refresh_results();
+        }
+    }
+
+    fn toggle_result_refine(&mut self) {
+        if let Some(state) = self.result_refine.take() {
+            self.query = state.base_query;
+            self.query_cursor = state.base_query_cursor.min(self.query.len());
+            self.results = state.base_results;
+            self.status = "result refine off".to_string();
+            self.finish_result_refresh();
+            return;
+        }
+
+        self.clamp_query_cursor();
+        let base_query = self.query.clone();
+        let base_query_cursor = self.query_cursor;
+        let base_count = self.results.len();
+        self.result_refine = Some(ResultRefineState {
+            base_query,
+            base_query_cursor,
+            base_results: self.results.clone(),
+        });
+        self.query.clear();
+        self.query_cursor = 0;
+        self.status = format!("result refine: fuzzy over {base_count} results; Ctrl-R return");
         self.refresh_results();
     }
 
@@ -381,13 +465,14 @@ impl App {
                 }
                 KeyCode::Char('t') | KeyCode::Char('T') => {
                     self.filter = self.filter.next();
-                    self.refresh_results();
+                    self.refresh_after_search_context_change();
                     return Ok(());
                 }
-                KeyCode::Char('r')
-                | KeyCode::Char('R')
-                | KeyCode::Char('f')
-                | KeyCode::Char('F') => {
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.toggle_result_refine();
+                    return Ok(());
+                }
+                KeyCode::Char('f') | KeyCode::Char('F') => {
                     return Ok(());
                 }
                 KeyCode::Char('l') | KeyCode::Char('L') => {
@@ -545,7 +630,7 @@ fn refresh_after_editor(app: &mut App) -> Result<()> {
     ensure_indexes(&app.config.libraries, false, |_library, _stage| {})?;
     let manager = IndexManager::open(&app.config.libraries)?;
     app.engine = SearchEngine::new(manager);
-    app.refresh_results();
+    app.refresh_after_search_context_change();
     Ok(())
 }
 
@@ -641,9 +726,9 @@ fn draw_results(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let header = if app.status.is_empty() {
         match app.focus {
             Focus::Preview => {
-                "Tab results | Enter/Space copy | C-K exact/fuzzy | C-T filter | C-L lib | C-H help | C-Q quit"
+                "Tab results | Enter/Space copy | C-K exact/fuzzy | C-R refine | C-T filter | C-L lib | C-H help | C-Q quit"
             }
-            _ => "Tab preview | Enter open | C-K exact/fuzzy | C-T filter | C-L lib | C-H help | C-Q quit",
+            _ => "Tab preview | Enter open | C-K exact/fuzzy | C-R refine | C-T filter | C-L lib | C-H help | C-Q quit",
         }
         .to_string()
     } else {
@@ -716,6 +801,58 @@ fn highlighted_result_line(result: &SearchResult, query: &str) -> Line<'static> 
     }
 
     Line::from(highlighted_text_spans(&text, &terms))
+}
+
+fn fuzzy_refine_results(candidates: &[SearchResult], query: &str) -> Vec<SearchResult> {
+    let query = query.trim();
+    if query.is_empty() {
+        return candidates.to_vec();
+    }
+
+    let mut matcher = Matcher::new(FuzzyConfig::DEFAULT.match_paths());
+    let pattern = Pattern::new(
+        query,
+        CaseMatching::Ignore,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+    );
+    let mut buf = Vec::new();
+    let mut scored = Vec::new();
+
+    for (idx, result) in candidates.iter().enumerate() {
+        let text = result_refine_text(result);
+        let Some(score) = pattern.score(Utf32Str::new(&text, &mut buf), &mut matcher) else {
+            continue;
+        };
+        let mut result = result.clone();
+        let original_score = result.score;
+        result.score = score as f32 + original_score * 0.001;
+        result.rank_reason = "result-refine".to_string();
+        scored.push((score, original_score, idx, result));
+    }
+
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    scored.into_iter().map(|(_, _, _, result)| result).collect()
+}
+
+fn result_refine_text(result: &SearchResult) -> String {
+    format!(
+        "{} {} {}",
+        result.display_line(),
+        result.title,
+        result.snippet
+    )
 }
 
 fn highlighted_preview_line(
@@ -852,6 +989,7 @@ fn help_lines() -> &'static [(&'static str, &'static str)] {
         ("Esc", "cancel popup/copy/focus; quit from results"),
         ("Tab", "switch results and preview focus; close popups"),
         ("Ctrl-K", "toggle exact/fuzzy query mode"),
+        ("Ctrl-R", "toggle fuzzy refine over current results"),
         ("Ctrl-T", "cycle result filter: all, names, content, man"),
         ("Ctrl-L", "cycle pinned libraries or open library picker"),
         ("typing", "edit the query in results mode"),
@@ -929,10 +1067,14 @@ mod tests {
     }
 
     fn search_result(path: &str, line: usize) -> SearchResult {
+        search_result_with_title(path, line, "Example")
+    }
+
+    fn search_result_with_title(path: &str, line: usize, title: &str) -> SearchResult {
         SearchResult {
-            title: "Example".to_string(),
+            title: title.to_string(),
             path: PathBuf::from(path),
-            rel_path: "example.md".to_string(),
+            rel_path: format!("{}.md", title.to_ascii_lowercase().replace(' ', "-")),
             library_alias: "test".to_string(),
             source_kind: "note".to_string(),
             line,
@@ -1044,14 +1186,48 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_r_no_longer_selects_exact_or_types_r() {
+    fn ctrl_r_toggles_result_refine_without_changing_query_mode() {
         let mut app = test_app();
         app.mode = MatchMode::Fuzzy;
+        app.query = "awk".to_string();
+        app.query_cursor = app.query.len();
+        app.results = vec![
+            search_result_with_title("/tmp/selected.md", 1, "Print Selected Fields"),
+            search_result_with_title("/tmp/archive.md", 1, "Archive Logs"),
+        ];
 
         app.handle_key(ctrl_key('r')).unwrap();
 
         assert_eq!(app.mode, MatchMode::Fuzzy);
         assert_eq!(app.query, "");
+        assert!(app.result_refine.is_some());
+
+        app.handle_key(ctrl_key('r')).unwrap();
+
+        assert_eq!(app.query, "awk");
+        assert!(app.result_refine.is_none());
+        assert_eq!(app.results.len(), 2);
+    }
+
+    #[test]
+    fn result_refine_fuzzy_filters_current_results() {
+        let mut app = test_app();
+        app.query = "awk".to_string();
+        app.query_cursor = app.query.len();
+        app.results = vec![
+            search_result_with_title("/tmp/selected.md", 1, "Print Selected Fields"),
+            search_result_with_title("/tmp/archive.md", 1, "Archive Logs"),
+        ];
+
+        app.handle_key(ctrl_key('r')).unwrap();
+        for ch in ['p', 's', 'f'] {
+            app.handle_key(key(KeyCode::Char(ch))).unwrap();
+        }
+
+        assert_eq!(app.query, "psf");
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.results[0].title, "Print Selected Fields");
+        assert_eq!(app.results[0].rank_reason, "result-refine");
     }
 
     #[test]

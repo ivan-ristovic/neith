@@ -39,6 +39,7 @@ Popup sizing can be adjusted with `NEITH_POPUP_WIDTH` and `NEITH_POPUP_HEIGHT`.
 
 - `Tab`: switch results/preview focus
 - `Ctrl-K`: toggle exact/fuzzy query mode
+- `Ctrl-R`: toggle fuzzy refine over the current result list
 - `Ctrl-T`: cycle `all`, `names`, `content`, `man`
 - `Ctrl-L`: cycle pinned libraries or open the library selector, including `all`
 - `Ctrl-H`: open or close the help popup
