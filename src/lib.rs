@@ -1,0 +1,11 @@
+pub mod action;
+pub mod cli;
+pub mod config;
+pub mod diagnostics;
+pub mod indexer;
+pub mod library;
+pub mod man;
+pub mod note;
+pub mod query;
+pub mod search;
+pub mod tui;

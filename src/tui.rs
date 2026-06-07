@@ -1,0 +1,1091 @@
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::Result;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::{DefaultTerminal, Frame};
+
+use crate::action::{copy_text, open_editor};
+use crate::config::{EditorReturn, RuntimeConfig};
+use crate::indexer::{IndexManager, ensure_indexes};
+use crate::query::{LibraryScope, MatchMode, SearchRequest, SourceFilter, normalize_query};
+use crate::search::{SearchEngine, SearchResult};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Focus {
+    Results,
+    Preview,
+    LibrarySelector,
+    Help,
+}
+
+#[derive(Default)]
+struct PreviewState {
+    path: Option<PathBuf>,
+    lines: Vec<String>,
+    scroll: usize,
+    cursor: usize,
+    copy_mode: bool,
+    anchor: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EditorRequest {
+    path: PathBuf,
+    line: Option<usize>,
+}
+
+pub struct App {
+    config: RuntimeConfig,
+    engine: SearchEngine,
+    query: String,
+    query_cursor: usize,
+    filter: SourceFilter,
+    mode: MatchMode,
+    focus: Focus,
+    previous_focus: Focus,
+    results: Vec<SearchResult>,
+    selected: usize,
+    preview: PreviewState,
+    status: String,
+    library_scopes: Vec<LibraryScope>,
+    library_index: usize,
+    library_selector_index: usize,
+    pending_editor: Option<EditorRequest>,
+    should_quit: bool,
+}
+
+impl App {
+    pub fn new(config: RuntimeConfig, engine: SearchEngine, initial_query: String) -> Self {
+        let mut library_scopes = vec![LibraryScope::All];
+        for library in &config.libraries {
+            if library.pinned {
+                library_scopes.push(LibraryScope::Alias(library.alias.clone()));
+            }
+        }
+        let mut app = Self {
+            config,
+            engine,
+            query_cursor: initial_query.len(),
+            query: initial_query,
+            filter: SourceFilter::All,
+            mode: MatchMode::Fuzzy,
+            focus: Focus::Results,
+            previous_focus: Focus::Results,
+            results: Vec::new(),
+            selected: 0,
+            preview: PreviewState::default(),
+            status: String::new(),
+            library_scopes,
+            library_index: 0,
+            library_selector_index: 0,
+            pending_editor: None,
+            should_quit: false,
+        };
+        app.refresh_results();
+        app
+    }
+
+    fn current_library_scope(&self) -> LibraryScope {
+        self.library_scopes
+            .get(self.library_index)
+            .cloned()
+            .unwrap_or(LibraryScope::All)
+    }
+
+    fn refresh_results(&mut self) {
+        self.clamp_query_cursor();
+        let request = SearchRequest {
+            query: self.query.clone(),
+            filter: self.filter,
+            mode: self.mode,
+            library: self.current_library_scope(),
+            limit: 80,
+        };
+        self.results = self.engine.search(&request);
+        if self.selected >= self.results.len() {
+            self.selected = self.results.len().saturating_sub(1);
+        }
+        self.load_selected_preview();
+    }
+
+    fn load_selected_preview(&mut self) {
+        let Some(result) = self.results.get(self.selected) else {
+            self.preview = PreviewState::default();
+            return;
+        };
+        if self.preview.path.as_ref() == Some(&result.path) {
+            return;
+        }
+        let text = fs::read_to_string(&result.path).unwrap_or_default();
+        let cursor = result.line.saturating_sub(1);
+        self.preview = PreviewState {
+            path: Some(result.path.clone()),
+            lines: text.lines().map(str::to_string).collect(),
+            scroll: cursor.saturating_sub(3),
+            cursor,
+            copy_mode: false,
+            anchor: None,
+        };
+    }
+
+    fn select_next(&mut self) {
+        if self.selected + 1 < self.results.len() {
+            self.selected += 1;
+            self.load_selected_preview();
+        }
+    }
+
+    fn select_prev(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+            self.load_selected_preview();
+        }
+    }
+
+    fn preview_down(&mut self) {
+        if self.preview.cursor + 1 < self.preview.lines.len() {
+            self.preview.cursor += 1;
+            let min_scroll = self.preview.cursor.saturating_sub(3);
+            if min_scroll > self.preview.scroll {
+                self.preview.scroll = min_scroll;
+            }
+        }
+    }
+
+    fn preview_up(&mut self) {
+        if self.preview.cursor > 0 {
+            self.preview.cursor -= 1;
+            if self.preview.cursor < self.preview.scroll {
+                self.preview.scroll = self.preview.cursor;
+            }
+        }
+    }
+
+    fn preview_page_down(&mut self) {
+        let step = 20;
+        self.preview.cursor =
+            (self.preview.cursor + step).min(self.preview.lines.len().saturating_sub(1));
+        self.preview.scroll =
+            (self.preview.scroll + step).min(self.preview.lines.len().saturating_sub(1));
+    }
+
+    fn preview_page_up(&mut self) {
+        let step = 20;
+        self.preview.cursor = self.preview.cursor.saturating_sub(step);
+        self.preview.scroll = self.preview.scroll.saturating_sub(step);
+    }
+
+    fn toggle_library_scope(&mut self) {
+        if self.library_scopes.len() <= 1 {
+            self.focus = Focus::LibrarySelector;
+            return;
+        }
+        if self.library_index + 1 < self.library_scopes.len() {
+            self.library_index += 1;
+            self.refresh_results();
+        } else {
+            self.focus = Focus::LibrarySelector;
+            self.library_selector_index = 0;
+        }
+    }
+
+    fn choose_library_from_selector(&mut self) {
+        let scope = if self.library_selector_index == 0 {
+            LibraryScope::All
+        } else if let Some(library) = self
+            .config
+            .libraries
+            .get(self.library_selector_index.saturating_sub(1))
+        {
+            LibraryScope::Alias(library.alias.clone())
+        } else {
+            return;
+        };
+
+        if let Some(index) = self.library_scopes.iter().position(|item| item == &scope) {
+            self.library_index = index;
+        } else {
+            self.library_scopes.push(scope);
+            self.library_index = self.library_scopes.len() - 1;
+        }
+        self.focus = Focus::Results;
+        self.refresh_results();
+    }
+
+    fn library_selector_len(&self) -> usize {
+        self.config.libraries.len() + 1
+    }
+
+    fn clamp_library_selector(&mut self) {
+        self.library_selector_index = self
+            .library_selector_index
+            .min(self.library_selector_len().saturating_sub(1));
+    }
+
+    fn library_selector_next(&mut self) {
+        self.clamp_library_selector();
+        if self.library_selector_index + 1 < self.library_selector_len() {
+            self.library_selector_index += 1;
+        }
+    }
+
+    fn library_selector_prev(&mut self) {
+        self.library_selector_index = self.library_selector_index.saturating_sub(1);
+    }
+
+    fn copy_preview_selection(&mut self) {
+        if self.preview.lines.is_empty() {
+            return;
+        }
+        let start = self
+            .preview
+            .anchor
+            .unwrap_or(self.preview.cursor)
+            .min(self.preview.cursor);
+        let end = self
+            .preview
+            .anchor
+            .unwrap_or(self.preview.cursor)
+            .max(self.preview.cursor);
+        let text = self.preview.lines[start..=end].join("\n");
+        match copy_text(&text) {
+            Ok(()) => self.status = format!("copied lines {}-{}", start + 1, end + 1),
+            Err(err) => self.status = format!("copy failed: {err}"),
+        }
+        self.preview.copy_mode = false;
+        self.preview.anchor = None;
+    }
+
+    fn toggle_help(&mut self) {
+        if self.focus == Focus::Help {
+            self.focus = self.previous_focus;
+        } else {
+            self.previous_focus = self.focus;
+            self.focus = Focus::Help;
+        }
+    }
+
+    fn close_help(&mut self) {
+        if self.focus == Focus::Help {
+            self.focus = self.previous_focus;
+        }
+    }
+
+    fn toggle_query_mode(&mut self) {
+        self.mode = match self.mode {
+            MatchMode::Fuzzy => MatchMode::Exact,
+            MatchMode::Exact => MatchMode::Fuzzy,
+        };
+        self.refresh_results();
+    }
+
+    fn clamp_query_cursor(&mut self) {
+        self.query_cursor = self.query_cursor.min(self.query.len());
+        while !self.query.is_char_boundary(self.query_cursor) {
+            self.query_cursor -= 1;
+        }
+    }
+
+    fn insert_query_char(&mut self, ch: char) {
+        self.clamp_query_cursor();
+        self.query.insert(self.query_cursor, ch);
+        self.query_cursor += ch.len_utf8();
+        self.refresh_results();
+    }
+
+    fn backspace_query_char(&mut self) {
+        self.clamp_query_cursor();
+        let Some((start, _)) = previous_query_char(&self.query, self.query_cursor) else {
+            return;
+        };
+        self.query.replace_range(start..self.query_cursor, "");
+        self.query_cursor = start;
+        self.refresh_results();
+    }
+
+    fn delete_previous_query_word(&mut self) {
+        self.clamp_query_cursor();
+        let mut start = self.query_cursor;
+        while let Some((idx, ch)) = previous_query_char(&self.query, start) {
+            if !ch.is_whitespace() {
+                break;
+            }
+            start = idx;
+        }
+        while let Some((idx, ch)) = previous_query_char(&self.query, start) {
+            if ch.is_whitespace() {
+                break;
+            }
+            start = idx;
+        }
+        if start == self.query_cursor {
+            return;
+        }
+        self.query.replace_range(start..self.query_cursor, "");
+        self.query_cursor = start;
+        self.refresh_results();
+    }
+
+    fn handle_results_control_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('w') | KeyCode::Char('W') => self.delete_previous_query_word(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn request_open_selected_result(&mut self) {
+        let Some(result) = self.results.get(self.selected) else {
+            self.status = "no result selected".to_string();
+            return;
+        };
+        self.pending_editor = Some(EditorRequest {
+            path: result.path.clone(),
+            line: (result.line > 0).then_some(result.line),
+        });
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    self.should_quit = true;
+                    return Ok(());
+                }
+                KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Backspace => {
+                    self.toggle_help();
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        if self.focus == Focus::Help {
+            return self.handle_help_key(key);
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.focus == Focus::Results && self.handle_results_control_key(key) {
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Char('k') | KeyCode::Char('K') => {
+                    self.toggle_query_mode();
+                    return Ok(());
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    self.filter = self.filter.next();
+                    self.refresh_results();
+                    return Ok(());
+                }
+                KeyCode::Char('r')
+                | KeyCode::Char('R')
+                | KeyCode::Char('f')
+                | KeyCode::Char('F') => {
+                    return Ok(());
+                }
+                KeyCode::Char('l') | KeyCode::Char('L') => {
+                    self.toggle_library_scope();
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        match self.focus {
+            Focus::Results => self.handle_results_key(key),
+            Focus::Preview => self.handle_preview_key(key),
+            Focus::LibrarySelector => self.handle_library_selector_key(key),
+            Focus::Help => self.handle_help_key(key),
+        }
+    }
+
+    fn handle_results_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Tab => self.focus = Focus::Preview,
+            KeyCode::Enter => self.request_open_selected_result(),
+            KeyCode::Up => self.select_prev(),
+            KeyCode::Down => self.select_next(),
+            KeyCode::Backspace => self.backspace_query_char(),
+            KeyCode::Char(ch) => self.insert_query_char(ch),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_preview_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                if self.preview.copy_mode {
+                    self.preview.copy_mode = false;
+                    self.preview.anchor = None;
+                } else {
+                    self.focus = Focus::Results;
+                }
+            }
+            KeyCode::Tab => self.focus = Focus::Results,
+            KeyCode::Up | KeyCode::Char('k') => self.preview_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.preview_down(),
+            KeyCode::PageUp => self.preview_page_up(),
+            KeyCode::PageDown => self.preview_page_down(),
+            KeyCode::Char('v') if self.preview.copy_mode => {
+                self.preview.anchor = Some(self.preview.cursor);
+                self.status = format!("selection anchor: line {}", self.preview.cursor + 1);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if self.preview.copy_mode {
+                    self.copy_preview_selection();
+                } else {
+                    self.preview.copy_mode = true;
+                    self.preview.anchor = Some(self.preview.cursor);
+                    self.status = "copy mode: move to select, Enter copy, Esc cancel".to_string();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_library_selector_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Tab => self.focus = Focus::Results,
+            KeyCode::Enter => self.choose_library_from_selector(),
+            KeyCode::Up | KeyCode::Char('k') => self.library_selector_prev(),
+            KeyCode::Down | KeyCode::Char('j') => self.library_selector_next(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_help_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc
+            | KeyCode::Tab
+            | KeyCode::Enter
+            | KeyCode::Char(' ')
+            | KeyCode::Char('q')
+            | KeyCode::Char('Q') => self.close_help(),
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+pub fn run(config: RuntimeConfig, engine: SearchEngine, initial_query: String) -> Result<()> {
+    let mut terminal = ratatui::init();
+    let result = run_inner(&mut terminal, App::new(config, engine, initial_query));
+    ratatui::restore();
+    result
+}
+
+fn run_inner(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
+    loop {
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        if app.should_quit {
+            return Ok(());
+        }
+        if event::poll(Duration::from_millis(80))?
+            && let Event::Key(key) = event::read()?
+        {
+            app.handle_key(key)?;
+            if let Some(request) = app.pending_editor.take() {
+                handle_editor_request(terminal, &mut app, request)?;
+                if app.should_quit {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn handle_editor_request(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    request: EditorRequest,
+) -> Result<()> {
+    ratatui::restore();
+    let editor_result = open_editor(&app.config.app.editor.command, &request.path, request.line);
+
+    match app.config.app.editor.return_behavior {
+        EditorReturn::Exit => {
+            app.should_quit = true;
+            editor_result?;
+        }
+        EditorReturn::Resume => {
+            *terminal = ratatui::init();
+            match editor_result {
+                Ok(status) => match refresh_after_editor(app) {
+                    Ok(()) if status.success() => {
+                        app.status = "returned from editor".to_string();
+                    }
+                    Ok(()) => {
+                        app.status = editor_status_message(status);
+                    }
+                    Err(err) => {
+                        app.status = format!("refresh failed: {err:#}");
+                    }
+                },
+                Err(err) => {
+                    app.status = format!("editor failed: {err}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn refresh_after_editor(app: &mut App) -> Result<()> {
+    ensure_indexes(&app.config.libraries, false, |_library, _stage| {})?;
+    let manager = IndexManager::open(&app.config.libraries)?;
+    app.engine = SearchEngine::new(manager);
+    app.refresh_results();
+    Ok(())
+}
+
+fn editor_status_message(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("editor exited with status {code}"),
+        None => "editor exited without a status code".to_string(),
+    }
+}
+
+fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+    draw_preview(frame, chunks[0], app);
+    draw_results(frame, chunks[1], app);
+    if app.focus == Focus::LibrarySelector {
+        draw_library_selector(frame, centered_rect(70, 70, area), app);
+    }
+    if app.focus == Focus::Help {
+        draw_help(frame, centered_rect(78, 78, area));
+    }
+}
+
+fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let title = match app.focus {
+        Focus::Preview if app.preview.copy_mode => " Preview [copy] ",
+        Focus::Preview => " Preview [focused] ",
+        _ => " Preview ",
+    };
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let start = app
+        .preview
+        .scroll
+        .min(app.preview.lines.len().saturating_sub(1));
+    let end = (start + visible_height).min(app.preview.lines.len());
+    let anchor = app.preview.anchor.unwrap_or(app.preview.cursor);
+    let range_start = anchor.min(app.preview.cursor);
+    let range_end = anchor.max(app.preview.cursor);
+    let terms = highlight_terms(&app.query);
+    let mut items = Vec::new();
+    for (idx, line) in app.preview.lines[start..end].iter().enumerate() {
+        let absolute = start + idx;
+        let line_has_match = line_has_highlight(line, &terms);
+        let mut style = Style::default();
+        if app.focus == Focus::Preview
+            && app.preview.copy_mode
+            && absolute >= range_start
+            && absolute <= range_end
+        {
+            style = style.bg(Color::DarkGray).fg(Color::White);
+        } else if app.focus == Focus::Preview && absolute == app.preview.cursor {
+            style = style.add_modifier(Modifier::REVERSED);
+        } else if line_has_match {
+            style = style.fg(Color::Cyan);
+        }
+        items.push(
+            ListItem::new(highlighted_preview_line(
+                absolute + 1,
+                line,
+                &terms,
+                line_has_match,
+            ))
+            .style(style),
+        );
+    }
+    if items.is_empty() {
+        items.push(ListItem::new("No preview"));
+    }
+    let list = List::new(items).block(Block::new().borders(Borders::BOTTOM).title(title));
+    frame.render_widget(list, area);
+}
+
+fn draw_results(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(area);
+    let prompt = prompt_text(app);
+    frame.render_widget(
+        Paragraph::new(prompt).style(Style::default().fg(Color::Cyan)),
+        chunks[0],
+    );
+    if app.focus == Focus::Results {
+        frame.set_cursor_position(prompt_cursor_position(app, chunks[0]));
+    }
+    let header = if app.status.is_empty() {
+        match app.focus {
+            Focus::Preview => {
+                "Tab results | Enter/Space copy | C-K exact/fuzzy | C-T filter | C-L lib | C-H help | C-Q quit"
+            }
+            _ => "Tab preview | Enter open | C-K exact/fuzzy | C-T filter | C-L lib | C-H help | C-Q quit",
+        }
+        .to_string()
+    } else {
+        app.status.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(header).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+    let items = app
+        .results
+        .iter()
+        .map(|result| ListItem::new(highlighted_result_line(result, &app.query)))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    if !app.results.is_empty() {
+        state.select(Some(app.selected));
+    }
+    let list = List::new(items)
+        .block(Block::default())
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(list, chunks[2], &mut state);
+}
+
+fn prompt_text(app: &App) -> String {
+    format!("{}{}", prompt_prefix(app), app.query)
+}
+
+fn prompt_prefix(app: &App) -> String {
+    let mode = match app.mode {
+        MatchMode::Exact => "E",
+        MatchMode::Fuzzy => "F",
+    };
+    let scope = app.current_library_scope();
+    let mut prefix = format!("{mode}:{}", scope.label());
+    if let Some(filter) = app.filter.label() {
+        prefix.push(':');
+        prefix.push_str(filter);
+    }
+    format!("{prefix}> ")
+}
+
+fn prompt_cursor_position(app: &App, area: Rect) -> (u16, u16) {
+    let cursor = app.query_cursor.min(app.query.len());
+    let cursor = if app.query.is_char_boundary(cursor) {
+        cursor
+    } else {
+        app.query
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .take_while(|idx| *idx < cursor)
+            .last()
+            .unwrap_or(0)
+    };
+    let cells = prompt_prefix(app).chars().count() + app.query[..cursor].chars().count();
+    let max_x = area.width.saturating_sub(1) as usize;
+    (area.x + cells.min(max_x) as u16, area.y)
+}
+
+fn previous_query_char(query: &str, cursor: usize) -> Option<(usize, char)> {
+    query[..cursor].char_indices().next_back()
+}
+
+fn highlighted_result_line(result: &SearchResult, query: &str) -> Line<'static> {
+    let text = format!("{}  {}", result.display_line(), result.title);
+    let terms = highlight_terms(query);
+    if terms.is_empty() {
+        return Line::from(text);
+    }
+
+    Line::from(highlighted_text_spans(&text, &terms))
+}
+
+fn highlighted_preview_line(
+    line_number: usize,
+    text: &str,
+    terms: &[String],
+    line_has_match: bool,
+) -> Line<'static> {
+    let number_style = if line_has_match {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let mut spans = vec![Span::styled(format!("{line_number:>5} "), number_style)];
+    spans.extend(highlighted_text_spans(text, terms));
+    Line::from(spans)
+}
+
+fn highlighted_text_spans(text: &str, terms: &[String]) -> Vec<Span<'static>> {
+    if terms.is_empty() {
+        return vec![Span::raw(text.to_string())];
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let Some((start, end)) = next_highlight_range(&lower, cursor, terms) else {
+            spans.push(Span::raw(text[cursor..].to_string()));
+            break;
+        };
+        if start > cursor {
+            spans.push(Span::raw(text[cursor..start].to_string()));
+        }
+        spans.push(Span::styled(
+            text[start..end].to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        cursor = end;
+    }
+
+    spans
+}
+
+fn line_has_highlight(text: &str, terms: &[String]) -> bool {
+    !terms.is_empty() && next_highlight_range(&text.to_ascii_lowercase(), 0, terms).is_some()
+}
+
+fn highlight_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for source in [query.to_string(), normalize_query(query)] {
+        for term in source.split(|ch: char| !ch.is_alphanumeric() && ch != '_') {
+            if term.is_empty() {
+                continue;
+            }
+            let term = term.to_ascii_lowercase();
+            if !terms.contains(&term) {
+                terms.push(term);
+            }
+        }
+    }
+    terms.sort_by_key(|term| std::cmp::Reverse(term.len()));
+    terms
+}
+
+fn next_highlight_range(
+    lower_text: &str,
+    cursor: usize,
+    terms: &[String],
+) -> Option<(usize, usize)> {
+    terms
+        .iter()
+        .filter_map(|term| {
+            lower_text[cursor..]
+                .find(term)
+                .map(|offset| (cursor + offset, cursor + offset + term.len()))
+        })
+        .min_by(|(left_start, left_end), (right_start, right_end)| {
+            left_start
+                .cmp(right_start)
+                .then_with(|| (right_end - right_start).cmp(&(left_end - left_start)))
+        })
+}
+
+fn draw_library_selector(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    frame.render_widget(Clear, area);
+    let mut items = vec![ListItem::new("all  all configured libraries")];
+    items.extend(
+        app.config
+            .libraries
+            .iter()
+            .map(|library| ListItem::new(format!("{}  {}", library.alias, library.path.display()))),
+    );
+    let mut state = ListState::default();
+    state.select(Some(app.library_selector_index));
+    let list = List::new(items)
+        .block(Block::bordered().title(" Libraries "))
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_help(frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(Clear, area);
+    let items = help_lines()
+        .iter()
+        .map(|(key, description)| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{key:<18}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(*description),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .block(Block::bordered().title(" Help "))
+        .style(Style::default().fg(Color::White));
+    frame.render_widget(list, area);
+}
+
+fn help_lines() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("Ctrl-H", "open or close this help popup"),
+        ("q/Enter/Space", "close this help popup"),
+        ("Ctrl-Q", "quit from any mode"),
+        ("Esc", "cancel popup/copy/focus; quit from results"),
+        ("Tab", "switch results and preview focus; close popups"),
+        ("Ctrl-K", "toggle exact/fuzzy query mode"),
+        ("Ctrl-T", "cycle result filter: all, names, content, man"),
+        ("Ctrl-L", "cycle pinned libraries or open library picker"),
+        ("typing", "edit the query in results mode"),
+        ("Backspace", "delete query text in results mode"),
+        ("Up/Down", "move through results"),
+        ("j/k", "move through preview lines or library picker"),
+        ("PageUp/PageDown", "move preview cursor by a page"),
+        (
+            "Enter",
+            "results: open selected result; picker: choose library",
+        ),
+        (
+            "Enter/Space",
+            "preview: start copy selection; copy mode: copy selected lines",
+        ),
+        (
+            "v",
+            "copy mode: move selection anchor to current preview line",
+        ),
+        (
+            "all",
+            "first library picker row searches all configured libraries",
+        ),
+    ]
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AppConfig, EditorConfig};
+
+    fn test_app() -> App {
+        let config = RuntimeConfig {
+            path: None,
+            app: AppConfig {
+                libraries: Vec::new(),
+                editor: EditorConfig {
+                    command: "true".to_string(),
+                    return_behavior: EditorReturn::Resume,
+                },
+            },
+            libraries: Vec::new(),
+        };
+        let engine = SearchEngine::new(IndexManager {
+            handles: Vec::new(),
+        });
+        App::new(config, engine, String::new())
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_key(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    fn search_result(path: &str, line: usize) -> SearchResult {
+        SearchResult {
+            title: "Example".to_string(),
+            path: PathBuf::from(path),
+            rel_path: "example.md".to_string(),
+            library_alias: "test".to_string(),
+            source_kind: "note".to_string(),
+            line,
+            snippet: String::new(),
+            score: 1.0,
+            rank_reason: "test".to_string(),
+            body: String::new(),
+            is_live_man: false,
+        }
+    }
+
+    #[test]
+    fn enter_in_results_requests_editor_open() {
+        let mut app = test_app();
+        app.results = vec![search_result("/tmp/example.md", 7)];
+
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(app.focus, Focus::Results);
+        assert_eq!(
+            app.pending_editor,
+            Some(EditorRequest {
+                path: PathBuf::from("/tmp/example.md"),
+                line: Some(7),
+            })
+        );
+    }
+
+    #[test]
+    fn tab_in_results_focuses_preview() {
+        let mut app = test_app();
+
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+
+        assert_eq!(app.focus, Focus::Preview);
+        assert_eq!(app.pending_editor, None);
+    }
+
+    #[test]
+    fn tab_in_preview_focuses_results() {
+        let mut app = test_app();
+        app.focus = Focus::Preview;
+
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+
+        assert_eq!(app.focus, Focus::Results);
+    }
+
+    #[test]
+    fn enter_in_preview_still_starts_copy_selection() {
+        let mut app = test_app();
+        app.focus = Focus::Preview;
+        app.preview.lines = vec!["first".to_string(), "second".to_string()];
+        app.preview.cursor = 1;
+
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        assert!(app.preview.copy_mode);
+        assert_eq!(app.preview.anchor, Some(1));
+        assert_eq!(app.pending_editor, None);
+    }
+
+    #[test]
+    fn prompt_omits_all_filter() {
+        let mut app = test_app();
+        app.mode = MatchMode::Exact;
+        app.query = "input query".to_string();
+
+        assert_eq!(prompt_text(&app), "E:all> input query");
+    }
+
+    #[test]
+    fn prompt_includes_specific_filter() {
+        let mut app = test_app();
+        app.query = "input query".to_string();
+        app.filter = SourceFilter::Names;
+        app.library_scopes = vec![LibraryScope::Alias("devdocs".to_string())];
+        app.library_index = 0;
+
+        assert_eq!(prompt_text(&app), "F:devdocs:names> input query");
+    }
+
+    #[test]
+    fn ctrl_k_toggles_mode_only() {
+        let mut app = test_app();
+        app.mode = MatchMode::Fuzzy;
+        app.filter = SourceFilter::Names;
+
+        app.handle_key(ctrl_key('k')).unwrap();
+
+        assert_eq!(app.mode, MatchMode::Exact);
+        assert_eq!(app.filter, SourceFilter::Names);
+
+        app.handle_key(ctrl_key('k')).unwrap();
+
+        assert_eq!(app.mode, MatchMode::Fuzzy);
+        assert_eq!(app.filter, SourceFilter::Names);
+    }
+
+    #[test]
+    fn ctrl_t_cycles_source_filter() {
+        let mut app = test_app();
+
+        app.handle_key(ctrl_key('t')).unwrap();
+        assert_eq!(app.filter, SourceFilter::Names);
+
+        app.handle_key(ctrl_key('t')).unwrap();
+        assert_eq!(app.filter, SourceFilter::Content);
+    }
+
+    #[test]
+    fn ctrl_r_no_longer_selects_exact_or_types_r() {
+        let mut app = test_app();
+        app.mode = MatchMode::Fuzzy;
+
+        app.handle_key(ctrl_key('r')).unwrap();
+
+        assert_eq!(app.mode, MatchMode::Fuzzy);
+        assert_eq!(app.query, "");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_previous_query_word() {
+        let mut app = test_app();
+        app.query = "alpha beta  ".to_string();
+        app.query_cursor = app.query.len();
+
+        app.handle_key(ctrl_key('w')).unwrap();
+
+        assert_eq!(app.query, "alpha ");
+        assert_eq!(app.query_cursor, "alpha ".len());
+    }
+
+    #[test]
+    fn typing_inserts_at_query_cursor() {
+        let mut app = test_app();
+        app.query = "alpha beta".to_string();
+        app.query_cursor = "alpha ".len();
+
+        app.handle_key(key(KeyCode::Char('X'))).unwrap();
+
+        assert_eq!(app.query, "alpha Xbeta");
+        assert_eq!(app.query_cursor, "alpha X".len());
+    }
+
+    #[test]
+    fn j_and_k_type_in_results_mode() {
+        let mut app = test_app();
+
+        app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        app.handle_key(key(KeyCode::Char('k'))).unwrap();
+
+        assert_eq!(app.query, "jk");
+        assert_eq!(app.focus, Focus::Results);
+    }
+}

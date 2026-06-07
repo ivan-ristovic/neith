@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bin="${NEITH_BIN:-$root/target/release/neith}"
+width="${NEITH_POPUP_WIDTH:-60%}"
+height="${NEITH_POPUP_HEIGHT:-80%}"
+title="${NEITH_POPUP_TITLE:-Neith}"
+
+if [ ! -x "$bin" ]; then
+    "$root/release"
+fi
+
+if [ -z "${TMUX:-}" ]; then
+    exec "$bin" "$@"
+fi
+
+cmd="$(printf '%q ' "$bin" "$@")"
+tmux display-popup -E -T "$title" -h "$height" -w "$width" "$cmd"

@@ -1,0 +1,113 @@
+[[libraries]]
+path = "/home/ivan/neith/neith-lib/"
+alias = "neith-lib"
+pinned = true
+
+[[libraries]]
+path = "/home/ivan/neith/neith-devdocs/generated/"
+alias = "devdocs"
+pinned = true
+
+[[libraries]]
+path = "/home/ivan/ol/ol-docs/"
+alias = "ol-docs"
+pinned = true
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal/compiler/docs//"
+alias = "compiler"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal/docs//"
+alias = "graal"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal/espresso/docs//"
+alias = "espresso"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal/regex/docs//"
+alias = "regex"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal/substratevm/docs//"
+alias = "substratevm"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal/sulong/docs//"
+alias = "sulong"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal/tools/docs//"
+alias = "tools"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal/truffle/docs//"
+alias = "truffle"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal/vm/docs//"
+alias = "vm"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal/wasm/docs//"
+alias = "wasm"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal-enterprise/compiler-fuzzing/docs//"
+alias = "compiler-fuzzing"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal-enterprise/docs//"
+alias = "graal-enterprise"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal-enterprise/graal-enterprise/docs//"
+alias = "graal-enterprise"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal-enterprise/substratevm-enterprise/docs//"
+alias = "substratevm-enterprise"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal-enterprise/sulong-managed/docs//"
+alias = "sulong-managed"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal-enterprise/tools-enterprise/src/com.oracle.truffle.tools.docs.test//"
+alias = "com.oracle.truffle.tools.docs.test"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal-enterprise/tools-enterprise/src/com.oracle.truffle.tools.docs.test/src/com/oracle/truffle/tools/docs//"
+alias = "tools"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal-enterprise/web-image/docs//"
+alias = "web-image"
+pinned = false
+
+[[libraries]]
+path = "/home/ivan/ol/bb/master/graal-enterprise/web-image-enterprise/docs//"
+alias = "web-image-enterprise"
+pinned = false
+
+[editor]
+command = "nvim"
+return_behavior = "exit"
