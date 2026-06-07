@@ -689,6 +689,9 @@ The installer writes generated scripts to:
 /usr/local/share/zsh/site-functions/_neith
 ```
 
+`./uninstall` removes those completion files. It removes `/usr/local/bin/neith`
+only when that path is a symlink to this checkout's `target/release/neith`.
+
 Manual installation can redirect the command output to a shell-specific
 completion directory.
 

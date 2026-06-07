@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+set -x
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+binary_link="/usr/local/bin/neith"
+target_binary="$script_dir/target/release/neith"
+
+if [ -L "$binary_link" ] && [ "$(readlink "$binary_link")" = "$target_binary" ]; then
+    sudo rm -f "$binary_link"
+elif [ -e "$binary_link" ]; then
+    echo "not removing $binary_link: not a symlink to $target_binary" >&2
+fi
+
+sudo rm -f /usr/share/bash-completion/completions/neith
+sudo rm -f /usr/local/share/zsh/site-functions/_neith

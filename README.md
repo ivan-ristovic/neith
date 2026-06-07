@@ -21,6 +21,15 @@ cargo build --release
 The installer builds the release binary, symlinks it as `/usr/local/bin/neith`,
 and installs bash and zsh completions.
 
+## Uninstall
+
+```sh
+./uninstall
+```
+
+The uninstaller removes the `/usr/local/bin/neith` symlink when it points to
+this checkout, plus the installed bash and zsh completion files.
+
 ## Run
 
 ```sh
