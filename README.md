@@ -86,11 +86,16 @@ pinned = true
 [editor]
 command = "nvim"
 return_behavior = "resume"
+
+[ui]
+preview_cursor_percent = 50
 ```
 
 Library paths are loaded from config first, then `NEITH_LIBS`, then `--libs`.
 `~/` is expanded at the start of a path. Shell variables such as `$HOME` are not
-expanded inside config strings.
+expanded inside config strings. `preview_cursor_percent` controls where the
+preview cursor sits in the visible preview pane while scrolling; `50` keeps it
+near the middle.
 
 Generate a config from currently resolved libraries:
 
@@ -175,6 +180,7 @@ neith json query awk print 3rd column --limit 10
 | `v` in copy mode | Move the selection anchor to the current line. |
 | `Up/Down` | Move result selection or preview cursor. |
 | `j/k`, `PageUp`, `PageDown` | Move through the preview. |
+| Mouse wheel over preview | Scroll preview text without changing focus or selection. |
 | `Ctrl-Q` | Quit from any mode. |
 | `Esc` | Cancel popup/copy/focus, or quit from results. |
 

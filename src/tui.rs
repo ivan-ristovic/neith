@@ -1,9 +1,14 @@
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEvent, MouseEventKind,
+};
+use crossterm::execute;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as FuzzyConfig, Matcher, Utf32Str};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -18,6 +23,8 @@ use crate::indexer::{IndexManager, ensure_indexes};
 use crate::note;
 use crate::query::{LibraryScope, MatchMode, SearchRequest, SourceFilter, normalize_query};
 use crate::search::{SearchEngine, SearchResult};
+
+const MOUSE_SCROLL_LINES: isize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Focus {
@@ -34,6 +41,7 @@ struct PreviewState {
     lines: Vec<String>,
     scroll: usize,
     cursor: usize,
+    viewport_height: usize,
     copy_mode: bool,
     anchor: Option<usize>,
 }
@@ -70,6 +78,7 @@ pub struct App {
     results: Vec<SearchResult>,
     selected: usize,
     preview: PreviewState,
+    preview_area: Option<Rect>,
     status: String,
     library_scopes: Vec<LibraryScope>,
     library_index: usize,
@@ -100,6 +109,7 @@ impl App {
             results: Vec::new(),
             selected: 0,
             preview: PreviewState::default(),
+            preview_area: None,
             status: String::new(),
             library_scopes,
             library_index: 0,
@@ -186,14 +196,17 @@ impl App {
         }
         let text = fs::read_to_string(&result.path).unwrap_or_default();
         let cursor = result.line.saturating_sub(1);
+        let viewport_height = self.preview.viewport_height;
         self.preview = PreviewState {
             path: Some(result.path.clone()),
             lines: text.lines().map(str::to_string).collect(),
-            scroll: cursor.saturating_sub(3),
+            scroll: 0,
             cursor,
+            viewport_height,
             copy_mode: false,
             anchor: None,
         };
+        self.reposition_preview_scroll();
     }
 
     fn select_next(&mut self) {
@@ -213,19 +226,14 @@ impl App {
     fn preview_down(&mut self) {
         if self.preview.cursor + 1 < self.preview.lines.len() {
             self.preview.cursor += 1;
-            let min_scroll = self.preview.cursor.saturating_sub(3);
-            if min_scroll > self.preview.scroll {
-                self.preview.scroll = min_scroll;
-            }
+            self.reposition_preview_scroll();
         }
     }
 
     fn preview_up(&mut self) {
         if self.preview.cursor > 0 {
             self.preview.cursor -= 1;
-            if self.preview.cursor < self.preview.scroll {
-                self.preview.scroll = self.preview.cursor;
-            }
+            self.reposition_preview_scroll();
         }
     }
 
@@ -233,14 +241,87 @@ impl App {
         let step = 20;
         self.preview.cursor =
             (self.preview.cursor + step).min(self.preview.lines.len().saturating_sub(1));
-        self.preview.scroll =
-            (self.preview.scroll + step).min(self.preview.lines.len().saturating_sub(1));
+        self.reposition_preview_scroll();
     }
 
     fn preview_page_up(&mut self) {
         let step = 20;
         self.preview.cursor = self.preview.cursor.saturating_sub(step);
-        self.preview.scroll = self.preview.scroll.saturating_sub(step);
+        self.reposition_preview_scroll();
+    }
+
+    fn preview_mouse_scroll_down(&mut self) {
+        self.scroll_preview_view(MOUSE_SCROLL_LINES);
+    }
+
+    fn preview_mouse_scroll_up(&mut self) {
+        self.scroll_preview_view(-MOUSE_SCROLL_LINES);
+    }
+
+    fn scroll_preview_view(&mut self, lines: isize) {
+        if self.preview.lines.is_empty() {
+            self.preview.scroll = 0;
+            return;
+        }
+        let max_scroll = self
+            .preview
+            .lines
+            .len()
+            .saturating_sub(self.preview.viewport_height.max(1));
+        if lines.is_negative() {
+            self.preview.scroll = self.preview.scroll.saturating_sub(lines.unsigned_abs());
+        } else {
+            self.preview.scroll = self
+                .preview
+                .scroll
+                .saturating_add(lines as usize)
+                .min(max_scroll);
+        }
+    }
+
+    fn set_preview_viewport_height(&mut self, height: usize) {
+        if self.preview.viewport_height == height {
+            return;
+        }
+        self.preview.viewport_height = height;
+        self.reposition_preview_scroll();
+    }
+
+    fn reposition_preview_scroll(&mut self) {
+        if self.preview.lines.is_empty() {
+            self.preview.scroll = 0;
+            return;
+        }
+        let height = self.preview.viewport_height.max(1);
+        let max_scroll = self.preview.lines.len().saturating_sub(height);
+        let target_offset =
+            preview_cursor_offset(height, self.config.app.ui.preview_cursor_percent);
+        self.preview.scroll = self
+            .preview
+            .cursor
+            .saturating_sub(target_offset)
+            .min(max_scroll);
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !self.mouse_can_scroll_preview() || !self.mouse_is_over_preview(mouse.column, mouse.row)
+        {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.preview_mouse_scroll_up(),
+            MouseEventKind::ScrollDown => self.preview_mouse_scroll_down(),
+            _ => {}
+        }
+    }
+
+    fn mouse_can_scroll_preview(&self) -> bool {
+        !matches!(self.focus, Focus::LibrarySelector | Focus::Help)
+    }
+
+    fn mouse_is_over_preview(&self, column: u16, row: u16) -> bool {
+        self.preview_area
+            .is_some_and(|area| rect_contains(area, column, row))
     }
 
     fn toggle_library_scope(&mut self) {
@@ -736,9 +817,9 @@ impl App {
 }
 
 pub fn run(config: RuntimeConfig, engine: SearchEngine, initial_query: String) -> Result<()> {
-    let mut terminal = ratatui::init();
+    let mut terminal = init_terminal()?;
     let result = run_inner(&mut terminal, App::new(config, engine, initial_query));
-    ratatui::restore();
+    restore_terminal();
     result
 }
 
@@ -748,10 +829,12 @@ fn run_inner(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
         if app.should_quit {
             return Ok(());
         }
-        if event::poll(Duration::from_millis(80))?
-            && let Event::Key(key) = event::read()?
-        {
-            app.handle_key(key)?;
+        if event::poll(Duration::from_millis(80))? {
+            match event::read()? {
+                Event::Key(key) => app.handle_key(key)?,
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                _ => {}
+            }
             if let Some(request) = app.pending_editor.take() {
                 handle_editor_request(terminal, &mut app, request)?;
                 if app.should_quit {
@@ -762,12 +845,38 @@ fn run_inner(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
     }
 }
 
+fn init_terminal() -> Result<DefaultTerminal> {
+    let terminal = ratatui::init();
+    if let Err(err) = enable_mouse_capture() {
+        ratatui::restore();
+        return Err(err);
+    }
+    Ok(terminal)
+}
+
+fn restore_terminal() {
+    let _ = disable_mouse_capture();
+    ratatui::restore();
+}
+
+fn enable_mouse_capture() -> Result<()> {
+    let mut stdout = io::stdout();
+    execute!(stdout, EnableMouseCapture)?;
+    Ok(())
+}
+
+fn disable_mouse_capture() -> Result<()> {
+    let mut stdout = io::stdout();
+    execute!(stdout, DisableMouseCapture)?;
+    Ok(())
+}
+
 fn handle_editor_request(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     request: EditorRequest,
 ) -> Result<()> {
-    ratatui::restore();
+    restore_terminal();
     let editor_result = open_editor(&app.config.app.editor.command, &request.path, request.line);
 
     match app.config.app.editor.return_behavior {
@@ -776,7 +885,7 @@ fn handle_editor_request(
             editor_result?;
         }
         EditorReturn::Resume => {
-            *terminal = ratatui::init();
+            *terminal = init_terminal()?;
             match editor_result {
                 Ok(status) => match refresh_after_editor(app) {
                     Ok(()) if status.success() => {
@@ -829,13 +938,15 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    app.preview_area = Some(area);
     let title = match app.focus {
         Focus::Preview if app.preview.copy_mode => " Preview [copy] ",
         Focus::Preview => " Preview [focused] ",
         _ => " Preview ",
     };
     let visible_height = area.height.saturating_sub(2) as usize;
+    app.set_preview_viewport_height(visible_height);
     let start = app
         .preview
         .scroll
@@ -1053,6 +1164,20 @@ fn result_refine_text(result: &SearchResult) -> String {
     )
 }
 
+fn preview_cursor_offset(height: usize, percent: u8) -> usize {
+    if height == 0 {
+        return 0;
+    }
+    (height * usize::from(percent.min(100)) / 100).min(height.saturating_sub(1))
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
 fn highlighted_preview_line(
     line_number: usize,
     text: &str,
@@ -1237,7 +1362,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, EditorConfig};
+    use crate::config::{AppConfig, EditorConfig, UiConfig};
     use crate::library::Library;
 
     fn test_app() -> App {
@@ -1253,6 +1378,7 @@ mod tests {
                     command: "true".to_string(),
                     return_behavior: EditorReturn::Resume,
                 },
+                ui: UiConfig::default(),
             },
             libraries,
         };
@@ -1497,6 +1623,66 @@ mod tests {
     }
 
     #[test]
+    fn preview_scroll_uses_configured_cursor_percent() {
+        let mut app = test_app();
+        app.preview.lines = (0..100).map(|idx| idx.to_string()).collect();
+        app.preview.viewport_height = 20;
+        app.preview.cursor = 50;
+        app.config.app.ui.preview_cursor_percent = 50;
+
+        app.reposition_preview_scroll();
+
+        assert_eq!(app.preview.scroll, 40);
+    }
+
+    #[test]
+    fn preview_cursor_percent_clamps_to_viewport() {
+        assert_eq!(preview_cursor_offset(20, 0), 0);
+        assert_eq!(preview_cursor_offset(20, 50), 10);
+        assert_eq!(preview_cursor_offset(20, 100), 19);
+        assert_eq!(preview_cursor_offset(20, 200), 19);
+    }
+
+    #[test]
+    fn mouse_scroll_over_preview_moves_scroll_without_focus_or_cursor_change() {
+        let mut app = test_app();
+        app.focus = Focus::Results;
+        app.preview_area = Some(Rect::new(0, 0, 80, 10));
+        app.preview.lines = (0..100).map(|idx| idx.to_string()).collect();
+        app.preview.viewport_height = 10;
+        app.preview.scroll = 20;
+        app.preview.cursor = 50;
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
+
+        assert_eq!(app.preview.scroll, 23);
+        assert_eq!(app.preview.cursor, 50);
+        assert_eq!(app.focus, Focus::Results);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 5, 5));
+
+        assert_eq!(app.preview.scroll, 20);
+        assert_eq!(app.preview.cursor, 50);
+        assert_eq!(app.focus, Focus::Results);
+    }
+
+    #[test]
+    fn mouse_scroll_ignores_events_outside_preview_or_behind_modal() {
+        let mut app = test_app();
+        app.preview_area = Some(Rect::new(0, 0, 80, 10));
+        app.preview.lines = (0..100).map(|idx| idx.to_string()).collect();
+        app.preview.viewport_height = 10;
+        app.preview.scroll = 20;
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 12));
+        assert_eq!(app.preview.scroll, 20);
+
+        app.focus = Focus::Help;
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
+        assert_eq!(app.preview.scroll, 20);
+    }
+
+    #[test]
     fn ctrl_w_deletes_previous_query_word() {
         let mut app = test_app();
         app.query = "alpha beta  ".to_string();
@@ -1529,5 +1715,14 @@ mod tests {
 
         assert_eq!(app.query, "jk");
         assert_eq!(app.focus, Focus::Results);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 }

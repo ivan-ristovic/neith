@@ -15,6 +15,9 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub editor: EditorConfig,
+
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -33,6 +36,12 @@ pub struct EditorConfig {
     pub return_behavior: EditorReturn,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiConfig {
+    #[serde(default = "default_preview_cursor_percent")]
+    pub preview_cursor_percent: u8,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum EditorReturn {
@@ -46,6 +55,14 @@ impl Default for EditorConfig {
         Self {
             command: default_editor_command(),
             return_behavior: EditorReturn::Exit,
+        }
+    }
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            preview_cursor_percent: default_preview_cursor_percent(),
         }
     }
 }
@@ -134,6 +151,7 @@ impl RuntimeConfig {
                 })
                 .collect(),
             editor: runtime.app.editor,
+            ui: runtime.app.ui,
         };
         let text = toml::to_string_pretty(&app)?;
         if let Some(parent) = path.parent() {
@@ -150,6 +168,10 @@ pub fn default_config_path() -> Option<PathBuf> {
 
 fn default_editor_command() -> String {
     env::var("EDITOR").unwrap_or_else(|_| "vi".to_string())
+}
+
+fn default_preview_cursor_percent() -> u8 {
+    50
 }
 
 fn extend_library_paths(libraries: &mut Vec<Library>, colon_list: &str) {
@@ -190,5 +212,17 @@ mod tests {
     #[test]
     fn editor_default_is_exit() {
         assert_eq!(EditorConfig::default().return_behavior, EditorReturn::Exit);
+    }
+
+    #[test]
+    fn ui_default_centers_preview_cursor() {
+        assert_eq!(UiConfig::default().preview_cursor_percent, 50);
+    }
+
+    #[test]
+    fn parses_ui_preview_cursor_percent() {
+        let app: AppConfig = toml::from_str("[ui]\npreview_cursor_percent = 35\n").unwrap();
+
+        assert_eq!(app.ui.preview_cursor_percent, 35);
     }
 }

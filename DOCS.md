@@ -75,6 +75,9 @@ pinned = true
 [editor]
 command = "nvim"
 return_behavior = "resume"
+
+[ui]
+preview_cursor_percent = 50
 ```
 
 Config fields:
@@ -86,6 +89,7 @@ Config fields:
 | `libraries[].pinned` | bool, optional | Adds the library to the fast `Ctrl-L` scope cycle. |
 | `editor.command` | string | Command used by `Enter` and `neith add`. Defaults to `$EDITOR` or `vi`. |
 | `editor.return_behavior` | `exit` or `resume` | Controls what happens after an editor exits from the TUI. |
+| `ui.preview_cursor_percent` | integer, default `50` | Preferred cursor position in the visible preview pane while scrolling. `0` is top, `50` is middle, `100` is bottom. Values above `100` are clamped. |
 
 Library sources are appended in this order:
 
@@ -617,6 +621,7 @@ Key behavior:
 | `Up/Down` | Move result selection, preview cursor, or picker selection. |
 | `j/k` | Move the preview cursor or picker selection. In results focus, `j` and `k` insert query text. |
 | `PageUp/PageDown` | Move the preview cursor by a page. |
+| Mouse wheel over preview | Scroll preview text without changing focus or moving the preview cursor. |
 | Typing in results | Insert query text and refresh results. |
 | `Backspace` in results | Delete the previous query character and refresh results. |
 
