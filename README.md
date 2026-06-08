@@ -1,78 +1,210 @@
-# Neith Native
+# Neith
 
-Native Rust implementation of Neith.
+## Summary
 
-The binary is named `neith`. It searches configured Markdown knowledge
-libraries through per-library Tantivy indexes stored under
-`.neith-cache/neith/`.
+Neith is a terminal search tool for Markdown knowledge libraries. It indexes
+configured libraries with Tantivy, searches notes, generated DevDocs pages, and
+man-page entries, and opens selected results directly in your editor.
 
-## Build
+Each library keeps its own cache under `.neith-cache/neith/`. The main config
+file is TOML at `${XDG_CONFIG_HOME:-~/.config}/neith/config.toml`.
+
+## Features
+
+- Fast indexed search over Markdown libraries.
+- Fuzzy and exact query modes.
+- Result filters for names, content, and man pages.
+- Live man-page lookup with rendered man-page caching.
+- TUI preview pane with line selection and clipboard copy.
+- Editor integration for opening results and creating new entries.
+- `status`, `healthcheck`, and JSON query commands for automation.
+- Bash and zsh completion generation.
+
+## Dependencies
+
+Build dependencies:
+
+- Rust toolchain with Cargo.
+
+Runtime dependencies:
+
+- An editor command, from `editor.command`, `$EDITOR`, or `vi`.
+- `xsel` or `tmux` for preview copy support.
+- `man` and `col` for live man-page results.
+
+The `install` and `uninstall` scripts use `sudo` for system paths under
+`/usr/local/bin`, `/usr/share/bash-completion`, and
+`/usr/local/share/zsh/site-functions`.
+
+## Installation
+
+Build from source:
 
 ```sh
 cargo build --release
 ```
 
-## Install
+Install the release binary and shell completions:
 
 ```sh
 ./install
 ```
 
-The installer builds the release binary, symlinks it as `/usr/local/bin/neith`,
-and installs bash and zsh completions.
+The installer symlinks the built binary to `/usr/local/bin/neith` and writes
+bash and zsh completions.
 
-## Uninstall
+Uninstall:
 
 ```sh
 ./uninstall
 ```
 
-The uninstaller removes the `/usr/local/bin/neith` symlink when it points to
-this checkout, plus the installed bash and zsh completion files.
+The uninstaller removes the installed completion files. It removes
+`/usr/local/bin/neith` only when that path is a symlink to this checkout.
 
-## Run
+## Configuration
 
-```sh
-NEITH_LIBS="/home/ivan/neith/neith-lib:/home/ivan/neith/neith-devdocs/generated" cargo run -- awk print 3rd column
+Create or edit:
+
+```text
+${XDG_CONFIG_HOME:-~/.config}/neith/config.toml
 ```
 
-Inside tmux:
+Example:
+
+```toml
+[[libraries]]
+path = "~/neith/neith-lib"
+alias = "neith-lib"
+pinned = true
+
+[[libraries]]
+path = "~/neith/neith-devdocs/generated"
+alias = "devdocs"
+pinned = true
+
+[editor]
+command = "nvim"
+return_behavior = "resume"
+```
+
+Library paths are loaded from config first, then `NEITH_LIBS`, then `--libs`.
+`~/` is expanded at the start of a path. Shell variables such as `$HOME` are not
+expanded inside config strings.
+
+Generate a config from currently resolved libraries:
+
+```sh
+NEITH_LIBS="$HOME/neith/neith-lib:$HOME/neith/neith-devdocs/generated" neith config init
+```
+
+## Usage
+
+Start the TUI:
+
+```sh
+neith
+```
+
+Start with an initial query:
+
+```sh
+neith awk print 3rd column
+```
+
+Run with explicit libraries:
+
+```sh
+neith --libs "$HOME/neith/neith-lib:$HOME/neith/neith-devdocs/generated" awk fields
+```
+
+Build or refresh indexes:
+
+```sh
+neith index
+neith index --rebuild
+```
+
+Check library and cache state:
+
+```sh
+neith status
+neith healthcheck
+```
+
+Query from scripts:
+
+```sh
+neith json query awk print 3rd column --limit 10
+```
+
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `neith [query...]` | Start the TUI, optionally with an initial query. |
+| `neith --config PATH` | Use an explicit TOML config path. |
+| `neith --libs PATHS` | Append colon-separated library paths. |
+| `neith --rebuild` | Rebuild indexes before TUI or JSON query startup. |
+| `neith index` | Incrementally build or update all configured indexes. |
+| `neith index --rebuild` | Remove and rebuild all configured library indexes. |
+| `neith status` | Print per-library index/cache status. |
+| `neith status --json` | Print status rows as JSON. |
+| `neith healthcheck` | Check config, libraries, indexes, editor, clipboard, and man tools. |
+| `neith healthcheck --json` | Print health checks as JSON. |
+| `neith add <query...>` | Create a note from the library template and open it in the editor. |
+| `neith config init` | Write a TOML config from resolved runtime libraries. |
+| `neith completions bash` | Print bash completions to stdout. |
+| `neith completions zsh` | Print zsh completions to stdout. |
+| `neith json query <query...>` | Search all libraries and print JSON results. |
+
+## TUI Keys
+
+| Key | Action |
+| --- | --- |
+| `Tab` | Switch results and preview focus. |
+| `Ctrl-A` | Add a new library entry from the current query. |
+| `Ctrl-K` | Toggle exact/fuzzy query mode. |
+| `Ctrl-R` | Toggle fuzzy refine over the current result list. |
+| `Ctrl-T` | Cycle result filters: `all`, `names`, `content`, `man`. |
+| `Ctrl-L` | Cycle pinned libraries or open the library selector. |
+| `Ctrl-H` | Open or close help. |
+| `Enter` in results | Open the selected result in the editor. |
+| `Enter` in add prompt | Create/open the edited note path. |
+| `Enter` or `Space` in preview | Start or finish copy selection. |
+| `v` in copy mode | Move the selection anchor to the current line. |
+| `Up/Down` | Move result selection or preview cursor. |
+| `j/k`, `PageUp`, `PageDown` | Move through the preview. |
+| `Ctrl-Q` | Quit from any mode. |
+| `Esc` | Cancel popup/copy/focus, or quit from results. |
+
+## Shell Completions
+
+The install script writes completions automatically. To install manually,
+redirect generated output to a directory loaded by your shell:
+
+```sh
+neith completions bash > ~/.local/share/bash-completion/completions/neith
+neith completions zsh > ~/.local/share/zsh/site-functions/_neith
+```
+
+## tmux Popup
+
+Bind Neith to a tmux popup:
 
 ```sh
 bind-key -r N run-shell "/path/to/neith/tmux_popup"
 ```
 
-Popup sizing can be adjusted with `NEITH_POPUP_WIDTH` and `NEITH_POPUP_HEIGHT`.
+Popup sizing can be adjusted with `NEITH_POPUP_WIDTH` and
+`NEITH_POPUP_HEIGHT`.
 
-## Keys
+## Development
 
-- `Tab`: switch results/preview focus
-- `Ctrl-A`: add a new library entry from the current query
-- `Ctrl-K`: toggle exact/fuzzy query mode
-- `Ctrl-R`: toggle fuzzy refine over the current result list
-- `Ctrl-T`: cycle `all`, `names`, `content`, `man`
-- `Ctrl-L`: cycle pinned libraries or open the library selector, including `all`
-- `Ctrl-H`: open or close the help popup
-- `Enter` in results: open the selected result in the editor
-- `Enter` or `Space` in preview: anchor copy selection; press again to copy selected lines
-- `v` in copy mode: move the selection anchor to the current line
-- arrows: move result selection or preview cursor
-- `j/k`, `PageUp`, `PageDown`: move/scroll preview
-- `Ctrl-Q`: quit from any mode
-- `Esc`: cancel mode/focus or quit from results
-
-## Commands
+Run the test script:
 
 ```sh
-neith index
-neith index --rebuild
-neith status
-neith status --json
-neith healthcheck
-neith healthcheck --json
-neith add awk "print selected fields"
-neith completions bash
-neith completions zsh
-neith config init
-neith json query awk print 3rd column
+./test
 ```
+
+Developer documentation lives in `DOCS.md`.
