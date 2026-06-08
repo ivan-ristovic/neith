@@ -15,6 +15,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::action::{copy_text, open_editor};
 use crate::config::{EditorReturn, RuntimeConfig};
 use crate::indexer::{IndexManager, ensure_indexes};
+use crate::note;
 use crate::query::{LibraryScope, MatchMode, SearchRequest, SourceFilter, normalize_query};
 use crate::search::{SearchEngine, SearchResult};
 
@@ -23,6 +24,7 @@ enum Focus {
     Results,
     Preview,
     LibrarySelector,
+    AddEntry,
     Help,
 }
 
@@ -49,6 +51,13 @@ struct ResultRefineState {
     base_results: Vec<SearchResult>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AddEntryState {
+    note_query: String,
+    path_text: String,
+    path_cursor: usize,
+}
+
 pub struct App {
     config: RuntimeConfig,
     engine: SearchEngine,
@@ -66,6 +75,7 @@ pub struct App {
     library_index: usize,
     library_selector_index: usize,
     result_refine: Option<ResultRefineState>,
+    add_entry: Option<AddEntryState>,
     pending_editor: Option<EditorRequest>,
     should_quit: bool,
 }
@@ -95,6 +105,7 @@ impl App {
             library_index: 0,
             library_selector_index: 0,
             result_refine: None,
+            add_entry: None,
             pending_editor: None,
             should_quit: false,
         };
@@ -369,6 +380,137 @@ impl App {
         self.refresh_results();
     }
 
+    fn begin_add_entry(&mut self) {
+        let note_query = self.note_query_for_new_entry();
+        match note::infer_note_path(&self.config.libraries, &note_query) {
+            Ok(path) => {
+                let path_text = path.display().to_string();
+                self.add_entry = Some(AddEntryState {
+                    note_query,
+                    path_cursor: path_text.len(),
+                    path_text,
+                });
+                self.focus = Focus::AddEntry;
+                self.status = "add entry: edit path, Enter open template, Esc cancel".to_string();
+            }
+            Err(err) => {
+                self.status = format!("add failed: {err:#}");
+            }
+        }
+    }
+
+    fn note_query_for_new_entry(&self) -> String {
+        self.result_refine
+            .as_ref()
+            .map(|state| state.base_query.clone())
+            .unwrap_or_else(|| self.query.clone())
+    }
+
+    fn cancel_add_entry(&mut self) {
+        self.add_entry = None;
+        self.focus = Focus::Results;
+        self.status = "add entry cancelled".to_string();
+    }
+
+    fn confirm_add_entry(&mut self) {
+        let Some(state) = &self.add_entry else {
+            return;
+        };
+        let path_text = state.path_text.trim();
+        if path_text.is_empty() {
+            self.status = "add failed: path is empty".to_string();
+            return;
+        }
+        let path = expand_tilde_path(path_text);
+        match note::create_note(&path, &state.note_query) {
+            Ok(()) => {
+                self.add_entry = None;
+                self.focus = Focus::Results;
+                self.status = format!("opening {}", path.display());
+                self.pending_editor = Some(EditorRequest { path, line: None });
+            }
+            Err(err) => {
+                self.status = format!("add failed: {err:#}");
+            }
+        }
+    }
+
+    fn clamp_add_path_cursor(&mut self) {
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        state.path_cursor = state.path_cursor.min(state.path_text.len());
+        while !state.path_text.is_char_boundary(state.path_cursor) {
+            state.path_cursor -= 1;
+        }
+    }
+
+    fn insert_add_path_char(&mut self, ch: char) {
+        self.clamp_add_path_cursor();
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        state.path_text.insert(state.path_cursor, ch);
+        state.path_cursor += ch.len_utf8();
+    }
+
+    fn backspace_add_path_char(&mut self) {
+        self.clamp_add_path_cursor();
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        let Some((start, _)) = previous_char(&state.path_text, state.path_cursor) else {
+            return;
+        };
+        state.path_text.replace_range(start..state.path_cursor, "");
+        state.path_cursor = start;
+    }
+
+    fn delete_previous_add_path_word(&mut self) {
+        self.clamp_add_path_cursor();
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        let mut start = state.path_cursor;
+        while let Some((idx, ch)) = previous_char(&state.path_text, start) {
+            if !ch.is_whitespace() && ch != '/' {
+                break;
+            }
+            start = idx;
+        }
+        while let Some((idx, ch)) = previous_char(&state.path_text, start) {
+            if ch.is_whitespace() || ch == '/' {
+                break;
+            }
+            start = idx;
+        }
+        if start == state.path_cursor {
+            return;
+        }
+        state.path_text.replace_range(start..state.path_cursor, "");
+        state.path_cursor = start;
+    }
+
+    fn move_add_path_left(&mut self) {
+        self.clamp_add_path_cursor();
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        if let Some((idx, _)) = previous_char(&state.path_text, state.path_cursor) {
+            state.path_cursor = idx;
+        }
+    }
+
+    fn move_add_path_right(&mut self) {
+        self.clamp_add_path_cursor();
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        if let Some((idx, ch)) = next_char(&state.path_text, state.path_cursor) {
+            state.path_cursor = idx + ch.len_utf8();
+        }
+    }
+
     fn clamp_query_cursor(&mut self) {
         self.query_cursor = self.query_cursor.min(self.query.len());
         while !self.query.is_char_boundary(self.query_cursor) {
@@ -385,7 +527,7 @@ impl App {
 
     fn backspace_query_char(&mut self) {
         self.clamp_query_cursor();
-        let Some((start, _)) = previous_query_char(&self.query, self.query_cursor) else {
+        let Some((start, _)) = previous_char(&self.query, self.query_cursor) else {
             return;
         };
         self.query.replace_range(start..self.query_cursor, "");
@@ -396,13 +538,13 @@ impl App {
     fn delete_previous_query_word(&mut self) {
         self.clamp_query_cursor();
         let mut start = self.query_cursor;
-        while let Some((idx, ch)) = previous_query_char(&self.query, start) {
+        while let Some((idx, ch)) = previous_char(&self.query, start) {
             if !ch.is_whitespace() {
                 break;
             }
             start = idx;
         }
-        while let Some((idx, ch)) = previous_query_char(&self.query, start) {
+        while let Some((idx, ch)) = previous_char(&self.query, start) {
             if ch.is_whitespace() {
                 break;
             }
@@ -454,11 +596,19 @@ impl App {
             return self.handle_help_key(key);
         }
 
+        if self.focus == Focus::AddEntry {
+            return self.handle_add_entry_key(key);
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.focus == Focus::Results && self.handle_results_control_key(key) {
                 return Ok(());
             }
             match key.code {
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.begin_add_entry();
+                    return Ok(());
+                }
                 KeyCode::Char('k') | KeyCode::Char('K') => {
                     self.toggle_query_mode();
                     return Ok(());
@@ -487,6 +637,7 @@ impl App {
             Focus::Results => self.handle_results_key(key),
             Focus::Preview => self.handle_preview_key(key),
             Focus::LibrarySelector => self.handle_library_selector_key(key),
+            Focus::AddEntry => self.handle_add_entry_key(key),
             Focus::Help => self.handle_help_key(key),
         }
     }
@@ -500,6 +651,27 @@ impl App {
             KeyCode::Down => self.select_next(),
             KeyCode::Backspace => self.backspace_query_char(),
             KeyCode::Char(ch) => self.insert_query_char(ch),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_add_entry_key(&mut self, key: KeyEvent) -> Result<()> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('w') | KeyCode::Char('W') => self.delete_previous_add_path_word(),
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Esc => self.cancel_add_entry(),
+            KeyCode::Enter => self.confirm_add_entry(),
+            KeyCode::Left => self.move_add_path_left(),
+            KeyCode::Right => self.move_add_path_right(),
+            KeyCode::Backspace => self.backspace_add_path_char(),
+            KeyCode::Char(ch) => self.insert_add_path_char(ch),
             _ => {}
         }
         Ok(())
@@ -720,15 +892,16 @@ fn draw_results(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Paragraph::new(prompt).style(Style::default().fg(Color::Cyan)),
         chunks[0],
     );
-    if app.focus == Focus::Results {
+    if matches!(app.focus, Focus::Results | Focus::AddEntry) {
         frame.set_cursor_position(prompt_cursor_position(app, chunks[0]));
     }
     let header = if app.status.is_empty() {
         match app.focus {
+            Focus::AddEntry => "Enter create/open | Esc cancel | Left/Right edit path | C-Q quit",
             Focus::Preview => {
-                "Tab results | Enter/Space copy | C-K exact/fuzzy | C-R refine | C-T filter | C-L lib | C-H help | C-Q quit"
+                "Tab results | Enter/Space copy | C-A add | C-K exact/fuzzy | C-R refine | C-T filter | C-L lib | C-H help | C-Q quit"
             }
-            _ => "Tab preview | Enter open | C-K exact/fuzzy | C-R refine | C-T filter | C-L lib | C-H help | C-Q quit",
+            _ => "Tab preview | Enter open | C-A add | C-K exact/fuzzy | C-R refine | C-T filter | C-L lib | C-H help | C-Q quit",
         }
         .to_string()
     } else {
@@ -755,10 +928,19 @@ fn draw_results(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn prompt_text(app: &App) -> String {
-    format!("{}{}", prompt_prefix(app), app.query)
+    let (prefix, text, _) = prompt_parts(app);
+    format!("{prefix}{text}")
 }
 
-fn prompt_prefix(app: &App) -> String {
+fn prompt_parts(app: &App) -> (String, String, usize) {
+    if let Some(add_entry) = &app.add_entry {
+        return (
+            "add> ".to_string(),
+            add_entry.path_text.clone(),
+            add_entry.path_cursor,
+        );
+    }
+
     let mode = match app.mode {
         MatchMode::Exact => "E",
         MatchMode::Fuzzy => "F",
@@ -769,28 +951,44 @@ fn prompt_prefix(app: &App) -> String {
         prefix.push(':');
         prefix.push_str(filter);
     }
-    format!("{prefix}> ")
+    (format!("{prefix}> "), app.query.clone(), app.query_cursor)
 }
 
 fn prompt_cursor_position(app: &App, area: Rect) -> (u16, u16) {
-    let cursor = app.query_cursor.min(app.query.len());
-    let cursor = if app.query.is_char_boundary(cursor) {
+    let (prefix, text, cursor) = prompt_parts(app);
+    let cursor = cursor.min(text.len());
+    let cursor = if text.is_char_boundary(cursor) {
         cursor
     } else {
-        app.query
-            .char_indices()
+        text.char_indices()
             .map(|(idx, _)| idx)
             .take_while(|idx| *idx < cursor)
             .last()
             .unwrap_or(0)
     };
-    let cells = prompt_prefix(app).chars().count() + app.query[..cursor].chars().count();
+    let cells = prefix.chars().count() + text[..cursor].chars().count();
     let max_x = area.width.saturating_sub(1) as usize;
     (area.x + cells.min(max_x) as u16, area.y)
 }
 
-fn previous_query_char(query: &str, cursor: usize) -> Option<(usize, char)> {
-    query[..cursor].char_indices().next_back()
+fn previous_char(value: &str, cursor: usize) -> Option<(usize, char)> {
+    value[..cursor].char_indices().next_back()
+}
+
+fn next_char(value: &str, cursor: usize) -> Option<(usize, char)> {
+    value[cursor..]
+        .char_indices()
+        .next()
+        .map(|(idx, ch)| (cursor + idx, ch))
+}
+
+fn expand_tilde_path(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(path)
 }
 
 fn highlighted_result_line(result: &SearchResult, query: &str) -> Line<'static> {
@@ -988,6 +1186,7 @@ fn help_lines() -> &'static [(&'static str, &'static str)] {
         ("Ctrl-Q", "quit from any mode"),
         ("Esc", "cancel popup/copy/focus; quit from results"),
         ("Tab", "switch results and preview focus; close popups"),
+        ("Ctrl-A", "add a new library entry from the current query"),
         ("Ctrl-K", "toggle exact/fuzzy query mode"),
         ("Ctrl-R", "toggle fuzzy refine over current results"),
         ("Ctrl-T", "cycle result filter: all, names, content, man"),
@@ -1039,8 +1238,13 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::config::{AppConfig, EditorConfig};
+    use crate::library::Library;
 
     fn test_app() -> App {
+        test_app_with_libraries(Vec::new())
+    }
+
+    fn test_app_with_libraries(libraries: Vec<Library>) -> App {
         let config = RuntimeConfig {
             path: None,
             app: AppConfig {
@@ -1050,7 +1254,7 @@ mod tests {
                     return_behavior: EditorReturn::Resume,
                 },
             },
-            libraries: Vec::new(),
+            libraries,
         };
         let engine = SearchEngine::new(IndexManager {
             handles: Vec::new(),
@@ -1183,6 +1387,68 @@ mod tests {
 
         app.handle_key(ctrl_key('t')).unwrap();
         assert_eq!(app.filter, SourceFilter::Content);
+    }
+
+    #[test]
+    fn ctrl_a_enters_add_entry_with_inferred_path() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("awk")).unwrap();
+        let library = Library::new(
+            temp.path().to_path_buf(),
+            Some("neith-lib".to_string()),
+            Some(true),
+        );
+        let mut app = test_app_with_libraries(vec![library]);
+        app.query = "awk print selected fields".to_string();
+        app.query_cursor = app.query.len();
+
+        app.handle_key(ctrl_key('a')).unwrap();
+
+        assert_eq!(app.focus, Focus::AddEntry);
+        let add_entry = app.add_entry.as_ref().unwrap();
+        assert_eq!(add_entry.note_query, "awk print selected fields");
+        assert_eq!(
+            add_entry.path_text,
+            temp.path()
+                .join("awk")
+                .join("awk-print-selected-fields.md")
+                .display()
+                .to_string()
+        );
+        assert_eq!(add_entry.path_cursor, add_entry.path_text.len());
+    }
+
+    #[test]
+    fn add_entry_confirm_creates_template_note_and_requests_editor() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join(".neith-note-template.md"),
+            "# {{TITLE}}\n\nTask: {{QUERY}}\n",
+        )
+        .unwrap();
+        let library = Library::new(
+            temp.path().to_path_buf(),
+            Some("neith-lib".to_string()),
+            Some(true),
+        );
+        let mut app = test_app_with_libraries(vec![library]);
+        app.query = "awk print selected fields".to_string();
+        app.query_cursor = app.query.len();
+
+        app.handle_key(ctrl_key('a')).unwrap();
+        let path = temp.path().join("custom").join("entry.md");
+        let add_entry = app.add_entry.as_mut().unwrap();
+        add_entry.path_text = path.display().to_string();
+        add_entry.path_cursor = add_entry.path_text.len();
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# Entry\n\nTask: awk print selected fields\n"
+        );
+        assert_eq!(app.pending_editor, Some(EditorRequest { path, line: None }));
+        assert_eq!(app.focus, Focus::Results);
+        assert_eq!(app.add_entry, None);
     }
 
     #[test]

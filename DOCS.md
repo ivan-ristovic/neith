@@ -602,6 +602,7 @@ Key behavior:
 | Key | Behavior |
 | --- | --- |
 | `Tab` | Switch results and preview focus; close popups. |
+| `Ctrl-A` | Add a new library entry from the current query. |
 | `Ctrl-K` | Toggle fuzzy/exact query mode. |
 | `Ctrl-R` | Toggle fuzzy refine over the current result list. |
 | `Ctrl-T` | Cycle result filters: `all`, `names`, `content`, `man`. |
@@ -728,6 +729,11 @@ Index command colors:
 The target library is the first library with alias `neith-lib`, or the first
 configured library if `neith-lib` is absent.
 
+The TUI uses the same note creation path. `Ctrl-A` opens an `add>` prompt with
+an inferred destination path. Edit the path, press `Enter` to create/open the
+entry, or press `Esc` to cancel. If result-refine mode is active, the base query
+is used for the note instead of the refine query.
+
 Path inference:
 
 1. Use the first query word as the category candidate.
@@ -736,7 +742,18 @@ Path inference:
 4. Use the full query as the note filename slug.
 
 Existing files are left unchanged. New notes include a generated title, the
-original task text, a starter code block, and a references section.
+original task text, a starter code block, and a references section unless the
+target library provides a template.
+
+Template lookup walks upward from the destination file and uses the first
+`.neith-note-template.md` found. Supported placeholders are:
+
+| Placeholder | Value |
+| --- | --- |
+| `{{TITLE}}` | Title generated from the destination filename. |
+| `{{QUERY}}` | Original add query. |
+| `{{SLUG}}` | Destination filename stem. |
+| `{{PATH}}` | Destination path. |
 
 ## Clipboard
 

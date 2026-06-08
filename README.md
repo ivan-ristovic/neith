@@ -47,6 +47,7 @@ Popup sizing can be adjusted with `NEITH_POPUP_WIDTH` and `NEITH_POPUP_HEIGHT`.
 ## Keys
 
 - `Tab`: switch results/preview focus
+- `Ctrl-A`: add a new library entry from the current query
 - `Ctrl-K`: toggle exact/fuzzy query mode
 - `Ctrl-R`: toggle fuzzy refine over the current result list
 - `Ctrl-T`: cycle `all`, `names`, `content`, `man`
