@@ -179,7 +179,9 @@ neith json query awk print 3rd column --limit 10
 | `Enter` or `Space` in preview | Start or finish copy selection. |
 | `v` in copy mode | Move the selection anchor to the current line. |
 | `Up/Down` | Move result selection or preview cursor. |
-| `j/k`, `PageUp`, `PageDown` | Move through the preview. |
+| `j/k` | Move through the preview. |
+| `PageUp/PageDown` | Scroll preview text by a page without changing focus or selection. |
+| `Shift+Up/Shift+Down` | Scroll preview text by one line without changing focus or selection. |
 | Mouse wheel over preview | Scroll preview text without changing focus or selection. |
 | `Ctrl-Q` | Quit from any mode. |
 | `Esc` | Cancel popup/copy/focus, or quit from results. |

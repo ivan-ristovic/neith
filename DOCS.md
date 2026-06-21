@@ -620,7 +620,8 @@ Key behavior:
 | `v` in preview copy mode | Move the selection anchor to the current line. |
 | `Up/Down` | Move result selection, preview cursor, or picker selection. |
 | `j/k` | Move the preview cursor or picker selection. In results focus, `j` and `k` insert query text. |
-| `PageUp/PageDown` | Move the preview cursor by a page. |
+| `PageUp/PageDown` | Scroll preview text by a page without changing focus or moving the preview cursor. |
+| `Shift+Up/Shift+Down` | Scroll preview text by one line without changing focus or moving the preview cursor. |
 | Mouse wheel over preview | Scroll preview text without changing focus or moving the preview cursor. |
 | Typing in results | Insert query text and refresh results. |
 | `Backspace` in results | Delete the previous query character and refresh results. |

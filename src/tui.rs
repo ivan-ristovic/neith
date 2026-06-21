@@ -238,16 +238,21 @@ impl App {
     }
 
     fn preview_page_down(&mut self) {
-        let step = 20;
-        self.preview.cursor =
-            (self.preview.cursor + step).min(self.preview.lines.len().saturating_sub(1));
-        self.reposition_preview_scroll();
+        let step = self.preview.viewport_height.max(1) as isize;
+        self.scroll_preview_view(step);
     }
 
     fn preview_page_up(&mut self) {
-        let step = 20;
-        self.preview.cursor = self.preview.cursor.saturating_sub(step);
-        self.reposition_preview_scroll();
+        let step = self.preview.viewport_height.max(1) as isize;
+        self.scroll_preview_view(-step);
+    }
+
+    fn preview_line_scroll_down(&mut self) {
+        self.scroll_preview_view(1);
+    }
+
+    fn preview_line_scroll_up(&mut self) {
+        self.scroll_preview_view(-1);
     }
 
     fn preview_mouse_scroll_down(&mut self) {
@@ -681,6 +686,10 @@ impl App {
             return self.handle_add_entry_key(key);
         }
 
+        if self.handle_preview_scroll_key(key) {
+            return Ok(());
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.focus == Focus::Results && self.handle_results_control_key(key) {
                 return Ok(());
@@ -758,6 +767,30 @@ impl App {
         Ok(())
     }
 
+    fn handle_preview_scroll_key(&mut self, key: KeyEvent) -> bool {
+        if !matches!(self.focus, Focus::Results | Focus::Preview) {
+            return false;
+        }
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
+        }
+        match key.code {
+            KeyCode::PageUp => self.preview_page_up(),
+            KeyCode::PageDown => self.preview_page_down(),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.preview_line_scroll_up();
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.preview_line_scroll_down();
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn handle_preview_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => {
@@ -771,8 +804,6 @@ impl App {
             KeyCode::Tab => self.focus = Focus::Results,
             KeyCode::Up | KeyCode::Char('k') => self.preview_up(),
             KeyCode::Down | KeyCode::Char('j') => self.preview_down(),
-            KeyCode::PageUp => self.preview_page_up(),
-            KeyCode::PageDown => self.preview_page_down(),
             KeyCode::Char('v') if self.preview.copy_mode => {
                 self.preview.anchor = Some(self.preview.cursor);
                 self.status = format!("selection anchor: line {}", self.preview.cursor + 1);
@@ -1320,7 +1351,8 @@ fn help_lines() -> &'static [(&'static str, &'static str)] {
         ("Backspace", "delete query text in results mode"),
         ("Up/Down", "move through results"),
         ("j/k", "move through preview lines or library picker"),
-        ("PageUp/PageDown", "move preview cursor by a page"),
+        ("PageUp/PageDown", "scroll preview by a page"),
+        ("Shift-Up/Down", "scroll preview by one line"),
         (
             "Enter",
             "results: open selected result; picker: choose library",
@@ -1394,6 +1426,10 @@ mod tests {
 
     fn ctrl_key(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    fn shift_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
     fn search_result(path: &str, line: usize) -> SearchResult {
@@ -1680,6 +1716,53 @@ mod tests {
         app.focus = Focus::Help;
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
         assert_eq!(app.preview.scroll, 20);
+    }
+
+    #[test]
+    fn page_keys_scroll_preview_without_focus_or_cursor_change() {
+        let mut app = test_app();
+        app.focus = Focus::Results;
+        app.selected = 3;
+        app.preview.lines = (0..100).map(|idx| idx.to_string()).collect();
+        app.preview.viewport_height = 10;
+        app.preview.scroll = 20;
+        app.preview.cursor = 50;
+
+        app.handle_key(key(KeyCode::PageDown)).unwrap();
+
+        assert_eq!(app.preview.scroll, 30);
+        assert_eq!(app.preview.cursor, 50);
+        assert_eq!(app.selected, 3);
+        assert_eq!(app.focus, Focus::Results);
+
+        app.handle_key(key(KeyCode::PageUp)).unwrap();
+
+        assert_eq!(app.preview.scroll, 20);
+        assert_eq!(app.preview.cursor, 50);
+        assert_eq!(app.selected, 3);
+        assert_eq!(app.focus, Focus::Results);
+    }
+
+    #[test]
+    fn shift_up_down_scroll_preview_without_moving_selection() {
+        let mut app = test_app();
+        app.focus = Focus::Preview;
+        app.preview.lines = (0..100).map(|idx| idx.to_string()).collect();
+        app.preview.viewport_height = 10;
+        app.preview.scroll = 20;
+        app.preview.cursor = 50;
+
+        app.handle_key(shift_key(KeyCode::Down)).unwrap();
+
+        assert_eq!(app.preview.scroll, 21);
+        assert_eq!(app.preview.cursor, 50);
+        assert_eq!(app.focus, Focus::Preview);
+
+        app.handle_key(shift_key(KeyCode::Up)).unwrap();
+
+        assert_eq!(app.preview.scroll, 20);
+        assert_eq!(app.preview.cursor, 50);
+        assert_eq!(app.focus, Focus::Preview);
     }
 
     #[test]
