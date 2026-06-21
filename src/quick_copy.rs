@@ -1,4 +1,4 @@
-const COPY_BEGIN_MARKER: &str = "<!-- copy_begin -->";
+const COPY_BEGIN_PREFIX: &str = "<!-- copy_begin";
 const COPY_END_MARKER: &str = "<!-- copy_end -->";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,14 +20,27 @@ struct MarkdownFence {
     info: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CopyOptions {
+    lines: Option<usize>,
+    prompt: Option<char>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CopyRegion {
+    body: String,
+    options: CopyOptions,
+}
+
 pub fn extract(text: &str) -> Result<ExtractedCopy, String> {
     if let Some(region) = extract_copy_region(text)? {
-        let blocks = code_blocks(&region);
+        let blocks = code_blocks(&region.body);
         let payload = if blocks.len() == 1 {
             blocks[0].body.clone()
         } else {
-            trim_blank_line_edges(region.lines().map(str::to_string).collect())
+            trim_blank_line_edges(region.body.lines().map(str::to_string).collect())
         };
+        let payload = region.options.apply(&payload);
         if payload.trim().is_empty() {
             return Err("quick-copy region is empty".to_string());
         }
@@ -46,14 +59,14 @@ pub fn first_non_empty_line(text: &str) -> Option<&str> {
     text.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
-fn extract_copy_region(text: &str) -> Result<Option<String>, String> {
+fn extract_copy_region(text: &str) -> Result<Option<CopyRegion>, String> {
     let mut in_fence: Option<MarkdownFence> = None;
-    let mut collecting = false;
+    let mut options: Option<CopyOptions> = None;
     let mut region = Vec::new();
 
     for line in text.lines() {
         if let Some(fence) = &in_fence {
-            if collecting {
+            if options.is_some() {
                 region.push(line.to_string());
             }
             if fence.closes(line) {
@@ -63,37 +76,125 @@ fn extract_copy_region(text: &str) -> Result<Option<String>, String> {
         }
 
         let trimmed = line.trim();
-        if collecting && trimmed == COPY_END_MARKER {
+        if options.is_some() && trimmed == COPY_END_MARKER {
             let region = trim_blank_line_edges(region);
             if region.trim().is_empty() {
                 return Err("quick-copy region is empty".to_string());
             }
-            return Ok(Some(region));
+            return Ok(Some(CopyRegion {
+                body: region,
+                options: options.unwrap_or_default(),
+            }));
         }
-        if !collecting && trimmed == COPY_BEGIN_MARKER {
-            collecting = true;
+        if options.is_none()
+            && let Some(copy_options) = parse_copy_begin_marker(trimmed)?
+        {
+            options = Some(copy_options);
             region.clear();
             continue;
         }
 
         if let Some(fence) = MarkdownFence::opening(line) {
-            if collecting {
+            if options.is_some() {
                 region.push(line.to_string());
             }
             in_fence = Some(fence);
             continue;
         }
 
-        if collecting {
+        if options.is_some() {
             region.push(line.to_string());
         }
     }
 
-    if collecting {
+    if options.is_some() {
         Err("copy_begin marker without copy_end marker".to_string())
     } else {
         Ok(None)
     }
+}
+
+fn parse_copy_begin_marker(line: &str) -> Result<Option<CopyOptions>, String> {
+    if !line.starts_with(COPY_BEGIN_PREFIX) {
+        return Ok(None);
+    }
+    if !line.ends_with("-->") {
+        return Err("invalid copy_begin marker".to_string());
+    }
+
+    let inner = line
+        .strip_prefix("<!--")
+        .and_then(|value| value.strip_suffix("-->"))
+        .map(str::trim)
+        .unwrap_or("");
+    let mut parts = inner.split_whitespace();
+    if parts.next() != Some("copy_begin") {
+        return Ok(None);
+    }
+
+    let mut options = CopyOptions::default();
+    for part in parts {
+        if let Some(value) = part.strip_prefix("l=") {
+            if options.lines.is_some() {
+                return Err("duplicate copy_begin l attribute".to_string());
+            }
+            let lines = value
+                .parse::<usize>()
+                .map_err(|_| "copy_begin l must be a positive integer".to_string())?;
+            if lines == 0 {
+                return Err("copy_begin l must be a positive integer".to_string());
+            }
+            options.lines = Some(lines);
+        } else if let Some(value) = part.strip_prefix("p=") {
+            if options.prompt.is_some() {
+                return Err("duplicate copy_begin p attribute".to_string());
+            }
+            let mut chars = value.chars();
+            let prompt = chars
+                .next()
+                .ok_or_else(|| "copy_begin p must be $ or #".to_string())?;
+            if chars.next().is_some() || !matches!(prompt, '$' | '#') {
+                return Err("copy_begin p must be $ or #".to_string());
+            }
+            options.prompt = Some(prompt);
+        } else {
+            return Err(format!("unsupported copy_begin attribute: {part}"));
+        }
+    }
+
+    Ok(Some(options))
+}
+
+impl CopyOptions {
+    fn apply(&self, payload: &str) -> String {
+        let mut lines = payload.lines().map(str::to_string).collect::<Vec<_>>();
+        if let Some(limit) = self.lines {
+            lines.truncate(limit);
+        }
+        if let Some(prompt) = self.prompt {
+            lines = lines
+                .into_iter()
+                .map(|line| strip_shell_prompt(&line, prompt))
+                .collect();
+        }
+        trim_blank_line_edges(lines)
+    }
+}
+
+fn strip_shell_prompt(line: &str, prompt: char) -> String {
+    let Some((prompt_index, ch)) = line.char_indices().find(|(_, ch)| !ch.is_whitespace()) else {
+        return line.to_string();
+    };
+    if ch != prompt {
+        return line.to_string();
+    }
+
+    let after_prompt = prompt_index + ch.len_utf8();
+    if !line[after_prompt..].starts_with(' ') {
+        return line.to_string();
+    }
+
+    format!("{}{}", &line[..prompt_index], &line[after_prompt + 1..])
 }
 
 fn code_blocks(text: &str) -> Vec<CodeBlock> {
@@ -201,6 +302,99 @@ And this line.
             Ok(ExtractedCopy::Payload(
                 "Copy this text.\nAnd this line.".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn marked_command_output_copies_selected_command_lines_and_strips_prompt() {
+        let text = r#"# Note
+
+<!-- copy_begin l=1 p=$ -->
+```bash
+$ echo 'foo'
+foo
+```
+<!-- copy_end -->
+"#;
+
+        assert_eq!(
+            extract(text),
+            Ok(ExtractedCopy::Payload("echo 'foo'".to_string()))
+        );
+    }
+
+    #[test]
+    fn marked_root_command_output_strips_hash_prompt() {
+        let text = r#"# Note
+
+<!-- copy_begin l=1 p=# -->
+```bash
+# systemctl restart nginx
+```
+<!-- copy_end -->
+"#;
+
+        assert_eq!(
+            extract(text),
+            Ok(ExtractedCopy::Payload(
+                "systemctl restart nginx".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn marked_multiline_command_output_copies_selected_command_lines() {
+        let text = r#"# Note
+
+<!-- copy_begin l=3 p=$ -->
+```bash
+$ cd /tmp
+$ printf '%s\n' foo
+$ pwd
+/tmp
+```
+<!-- copy_end -->
+"#;
+
+        assert_eq!(
+            extract(text),
+            Ok(ExtractedCopy::Payload(
+                "cd /tmp\nprintf '%s\\n' foo\npwd".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn prompt_stripping_requires_prompt_followed_by_space() {
+        let text = r#"# Note
+
+<!-- copy_begin l=2 p=$ -->
+```bash
+  $ echo ok
+$PATH
+```
+<!-- copy_end -->
+"#;
+
+        assert_eq!(
+            extract(text),
+            Ok(ExtractedCopy::Payload("  echo ok\n$PATH".to_string()))
+        );
+    }
+
+    #[test]
+    fn invalid_copy_begin_attributes_are_errors() {
+        assert_eq!(
+            extract("<!-- copy_begin l=0 -->\ntext\n<!-- copy_end -->"),
+            Err("copy_begin l must be a positive integer".to_string())
+        );
+        assert_eq!(
+            extract("<!-- copy_begin p=> -->\ntext\n<!-- copy_end -->"),
+            Err("copy_begin p must be $ or #".to_string())
+        );
+        assert_eq!(
+            extract("<!-- copy_begin x=1 -->\ntext\n<!-- copy_end -->"),
+            Err("unsupported copy_begin attribute: x=1".to_string())
         );
     }
 

@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
+const NEITHIGNORE_FILE: &str = ".neithignore";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Library {
     pub alias: String,
@@ -87,14 +89,16 @@ pub struct FileSignature {
 
 pub fn discover_markdown_entries(library: &Library) -> Result<Vec<EntryDoc>> {
     let mut entries = Vec::new();
+    let ignore = LibraryIgnore::load(&library.path)?;
     for item in WalkDir::new(&library.path)
         .follow_links(false)
         .into_iter()
-        .filter_entry(should_descend)
+        .filter_entry(|entry| should_descend(entry) && !ignore.matches(&library.path, entry.path()))
     {
         let item = item?;
         if !item.file_type().is_file()
             || item.path().extension().and_then(|ext| ext.to_str()) != Some("md")
+            || ignore.matches(&library.path, item.path())
         {
             continue;
         }
@@ -229,6 +233,59 @@ fn should_descend(entry: &DirEntry) -> bool {
     !matches!(name.as_ref(), ".git" | ".neith-cache" | "target" | ".cache")
 }
 
+#[derive(Debug, Default)]
+struct LibraryIgnore {
+    exact_paths: Vec<String>,
+    dir_prefixes: Vec<String>,
+}
+
+impl LibraryIgnore {
+    fn load(root: &Path) -> Result<Self> {
+        let path = root.join(NEITHIGNORE_FILE);
+        if !path.is_file() {
+            return Ok(Self::default());
+        }
+
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut ignore = Self::default();
+        for line in text.lines() {
+            let rule = line.trim();
+            if rule.is_empty() || rule.starts_with('#') {
+                continue;
+            }
+            let rule = rule.trim_start_matches("./").to_string();
+            if rule.ends_with('/') {
+                ignore.dir_prefixes.push(rule);
+            } else {
+                ignore.exact_paths.push(rule);
+            }
+        }
+        Ok(ignore)
+    }
+
+    fn matches(&self, root: &Path, path: &Path) -> bool {
+        let rel_path = match path.strip_prefix(root) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let rel_path = rel_path
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        if rel_path.is_empty() {
+            return false;
+        }
+        if self.exact_paths.iter().any(|rule| rule == &rel_path) {
+            return true;
+        }
+        self.dir_prefixes.iter().any(|prefix| {
+            let dir = prefix.trim_end_matches('/');
+            rel_path == dir || rel_path.starts_with(prefix)
+        })
+    }
+}
+
 pub fn infer_alias(path: &Path) -> String {
     let normalized = path.to_string_lossy();
     if normalized.contains("neith-devdocs/generated") {
@@ -280,6 +337,52 @@ mod tests {
             infer_alias(Path::new("/home/ivan/neith/neith-lib")),
             "neith-lib"
         );
+    }
+
+    #[test]
+    fn library_ignore_excludes_exact_files_and_directory_prefixes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join(".neithignore"),
+            "AGENTS.md\n.hidden/\nskip/\n",
+        )
+        .unwrap();
+        fs::write(temp.path().join("AGENTS.md"), "# Instructions\n").unwrap();
+        fs::write(temp.path().join("keep.md"), "# Keep\n").unwrap();
+        fs::create_dir(temp.path().join("skip")).unwrap();
+        fs::write(temp.path().join("skip").join("note.md"), "# Skip\n").unwrap();
+        fs::create_dir(temp.path().join(".hidden")).unwrap();
+        fs::write(temp.path().join(".hidden").join("note.md"), "# Hidden\n").unwrap();
+
+        let library = Library::new(temp.path().to_path_buf(), Some("test".to_string()), None);
+        let rel_paths = discover_markdown_entries(&library)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.rel_path)
+            .collect::<Vec<_>>();
+
+        assert_eq!(rel_paths, vec!["keep.md"]);
+    }
+
+    #[test]
+    fn library_ignore_comments_and_blank_lines_are_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join(".neithignore"),
+            "\n# comment\n./ignored.md\n",
+        )
+        .unwrap();
+        fs::write(temp.path().join("ignored.md"), "# Ignored\n").unwrap();
+        fs::write(temp.path().join("included.md"), "# Included\n").unwrap();
+
+        let library = Library::new(temp.path().to_path_buf(), Some("test".to_string()), None);
+        let rel_paths = discover_markdown_entries(&library)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.rel_path)
+            .collect::<Vec<_>>();
+
+        assert_eq!(rel_paths, vec!["included.md"]);
     }
 
     #[test]
