@@ -16,4 +16,11 @@ if [ -z "${TMUX:-}" ]; then
 fi
 
 cmd="$(printf '%q ' "$bin" "$@")"
-tmux display-popup -E -T "$title" -h "$height" -w "$width" "$cmd"
+target_pane="$(tmux display-message -p '#{pane_id}')"
+tmux display-popup \
+    -E \
+    -e "NEITH_TMUX_TARGET_PANE=$target_pane" \
+    -T "$title" \
+    -h "$height" \
+    -w "$width" \
+    "$cmd"

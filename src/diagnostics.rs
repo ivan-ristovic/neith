@@ -209,14 +209,29 @@ fn tool_checks(runtime: &RuntimeConfig) -> Vec<Check> {
         checks.push(failure("editor", format!("{editor} not found in PATH")));
     }
 
-    let clipboard_ok =
-        command_exists("xsel") || (std::env::var_os("TMUX").is_some() && command_exists("tmux"));
-    if clipboard_ok {
+    let clipboard_command = runtime.app.clipboard.command.trim();
+    if let Some(command) = clipboard_command.split_whitespace().next() {
+        if command_exists(command) {
+            checks.push(ok(
+                "clipboard",
+                format!("custom command: {clipboard_command}"),
+            ));
+        } else {
+            checks.push(warning(
+                "clipboard",
+                format!("custom command not found in PATH: {command}"),
+            ));
+        }
+    } else if command_exists("wl-copy")
+        || command_exists("xclip")
+        || command_exists("xsel")
+        || (std::env::var_os("TMUX").is_some() && command_exists("tmux"))
+    {
         checks.push(ok("clipboard", "backend available"));
     } else {
         checks.push(warning(
             "clipboard",
-            "no supported backend found (xsel or tmux)",
+            "no supported backend found (wl-copy, xclip, xsel, or tmux)",
         ));
     }
 
@@ -459,6 +474,7 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AppConfig, RuntimeConfig};
     use crate::indexer::ensure_indexes;
     use crate::library::Library;
 
@@ -527,6 +543,29 @@ mod tests {
             }
             .exit_code(),
             1
+        );
+    }
+
+    #[test]
+    fn tool_checks_report_missing_custom_clipboard_command() {
+        let mut runtime = RuntimeConfig {
+            path: None,
+            app: AppConfig::default(),
+            libraries: Vec::new(),
+        };
+        runtime.app.editor.command = "true".to_string();
+        runtime.app.clipboard.command = "definitely-missing-neith-copy --flag".to_string();
+
+        let checks = tool_checks(&runtime);
+        let clipboard = checks
+            .iter()
+            .find(|check| check.name == "clipboard")
+            .unwrap();
+
+        assert_eq!(clipboard.level, CheckLevel::Warning);
+        assert_eq!(
+            clipboard.detail,
+            "custom command not found in PATH: definitely-missing-neith-copy"
         );
     }
 }

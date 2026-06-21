@@ -17,6 +17,9 @@ pub struct AppConfig {
     pub editor: EditorConfig,
 
     #[serde(default)]
+    pub clipboard: ClipboardConfig,
+
+    #[serde(default)]
     pub ui: UiConfig,
 }
 
@@ -36,10 +39,64 @@ pub struct EditorConfig {
     pub return_behavior: EditorReturn,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ClipboardConfig {
+    #[serde(default)]
+    pub command: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiConfig {
     #[serde(default = "default_preview_cursor_percent")]
     pub preview_cursor_percent: u8,
+
+    #[serde(default)]
+    pub preview_syntax: PreviewSyntax,
+
+    #[serde(default)]
+    pub preview_bat_args: Vec<String>,
+
+    #[serde(default)]
+    pub prompt: PromptConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PromptConfig {
+    #[serde(default = "default_prompt_separator")]
+    pub separator: String,
+
+    #[serde(default = "default_prompt_right_separator")]
+    pub right_separator: String,
+
+    #[serde(default)]
+    pub colors: PromptColorsConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PromptColorsConfig {
+    #[serde(default = "default_prompt_fuzzy_color")]
+    pub fuzzy: String,
+
+    #[serde(default = "default_prompt_exact_color")]
+    pub exact: String,
+
+    #[serde(default = "default_prompt_scope_color")]
+    pub scope: String,
+
+    #[serde(default = "default_prompt_filter_color")]
+    pub filter: String,
+
+    #[serde(default = "default_prompt_separator_color")]
+    pub separator: String,
+
+    #[serde(default = "default_prompt_marker_color")]
+    pub marker: String,
+
+    #[serde(default = "default_prompt_query_color")]
+    pub query: String,
+
+    #[serde(default = "default_prompt_add_color")]
+    pub add: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
@@ -48,6 +105,15 @@ pub enum EditorReturn {
     #[default]
     Exit,
     Resume,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreviewSyntax {
+    #[default]
+    Auto,
+    Plain,
+    Bat,
 }
 
 impl Default for EditorConfig {
@@ -63,6 +129,34 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             preview_cursor_percent: default_preview_cursor_percent(),
+            preview_syntax: PreviewSyntax::Auto,
+            preview_bat_args: Vec::new(),
+            prompt: PromptConfig::default(),
+        }
+    }
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            separator: default_prompt_separator(),
+            right_separator: default_prompt_right_separator(),
+            colors: PromptColorsConfig::default(),
+        }
+    }
+}
+
+impl Default for PromptColorsConfig {
+    fn default() -> Self {
+        Self {
+            fuzzy: default_prompt_fuzzy_color(),
+            exact: default_prompt_exact_color(),
+            scope: default_prompt_scope_color(),
+            filter: default_prompt_filter_color(),
+            separator: default_prompt_separator_color(),
+            marker: default_prompt_marker_color(),
+            query: default_prompt_query_color(),
+            add: default_prompt_add_color(),
         }
     }
 }
@@ -93,6 +187,7 @@ impl RuntimeConfig {
         if app.editor.command.trim().is_empty() {
             app.editor.command = default_editor_command();
         }
+        app.clipboard.command = app.clipboard.command.trim().to_string();
 
         let mut libraries = Vec::new();
         for library in &app.libraries {
@@ -151,6 +246,7 @@ impl RuntimeConfig {
                 })
                 .collect(),
             editor: runtime.app.editor,
+            clipboard: runtime.app.clipboard,
             ui: runtime.app.ui,
         };
         let text = toml::to_string_pretty(&app)?;
@@ -172,6 +268,46 @@ fn default_editor_command() -> String {
 
 fn default_preview_cursor_percent() -> u8 {
     50
+}
+
+fn default_prompt_separator() -> String {
+    ":".to_string()
+}
+
+fn default_prompt_right_separator() -> String {
+    ">".to_string()
+}
+
+fn default_prompt_fuzzy_color() -> String {
+    "cyan".to_string()
+}
+
+fn default_prompt_exact_color() -> String {
+    "red".to_string()
+}
+
+fn default_prompt_scope_color() -> String {
+    "blue".to_string()
+}
+
+fn default_prompt_filter_color() -> String {
+    "green".to_string()
+}
+
+fn default_prompt_separator_color() -> String {
+    "dark-gray".to_string()
+}
+
+fn default_prompt_marker_color() -> String {
+    "dark-gray".to_string()
+}
+
+fn default_prompt_query_color() -> String {
+    "white".to_string()
+}
+
+fn default_prompt_add_color() -> String {
+    "cyan".to_string()
 }
 
 fn extend_library_paths(libraries: &mut Vec<Library>, colon_list: &str) {
@@ -220,9 +356,79 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_default_command_is_empty() {
+        assert_eq!(ClipboardConfig::default().command, "");
+    }
+
+    #[test]
+    fn parses_clipboard_command() {
+        let app: AppConfig =
+            toml::from_str("[clipboard]\ncommand = \"xclip -sel clip\"\n").unwrap();
+
+        assert_eq!(app.clipboard.command, "xclip -sel clip");
+    }
+
+    #[test]
+    fn ui_default_uses_auto_preview_syntax() {
+        assert_eq!(UiConfig::default().preview_syntax, PreviewSyntax::Auto);
+        assert!(UiConfig::default().preview_bat_args.is_empty());
+    }
+
+    #[test]
+    fn ui_default_prompt_uses_separator_and_colors() {
+        let prompt = UiConfig::default().prompt;
+
+        assert_eq!(prompt.separator, ":");
+        assert_eq!(prompt.right_separator, ">");
+        assert_eq!(prompt.colors.fuzzy, "cyan");
+        assert_eq!(prompt.colors.exact, "red");
+        assert_eq!(prompt.colors.scope, "blue");
+        assert_eq!(prompt.colors.filter, "green");
+        assert_eq!(prompt.colors.separator, "dark-gray");
+        assert_eq!(prompt.colors.marker, "dark-gray");
+        assert_eq!(prompt.colors.query, "white");
+        assert_eq!(prompt.colors.add, "cyan");
+    }
+
+    #[test]
     fn parses_ui_preview_cursor_percent() {
         let app: AppConfig = toml::from_str("[ui]\npreview_cursor_percent = 35\n").unwrap();
 
         assert_eq!(app.ui.preview_cursor_percent, 35);
+    }
+
+    #[test]
+    fn parses_ui_preview_syntax_and_bat_args() {
+        let app: AppConfig = toml::from_str(
+            "[ui]\npreview_syntax = \"plain\"\npreview_bat_args = [\"--theme=TwoDark\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(app.ui.preview_syntax, PreviewSyntax::Plain);
+        assert_eq!(app.ui.preview_bat_args, vec!["--theme=TwoDark"]);
+    }
+
+    #[test]
+    fn parses_ui_prompt_separator_and_colors() {
+        let app: AppConfig = toml::from_str(
+            "[ui.prompt]\nseparator = \"/\"\nright_separator = \"|\"\n\n[ui.prompt.colors]\nfuzzy = \"blue\"\nquery = \"white\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(app.ui.prompt.separator, "/");
+        assert_eq!(app.ui.prompt.right_separator, "|");
+        assert_eq!(app.ui.prompt.colors.fuzzy, "blue");
+        assert_eq!(app.ui.prompt.colors.query, "white");
+        assert_eq!(app.ui.prompt.colors.exact, "red");
+    }
+
+    #[test]
+    fn sample_config_parses() {
+        let sample = include_str!("../config-sample.toml");
+        let app: AppConfig = toml::from_str(sample).unwrap();
+
+        assert_eq!(app.ui.prompt.separator, ":");
+        assert_eq!(app.ui.prompt.right_separator, ">");
+        assert_eq!(app.ui.prompt.colors.query, "white");
     }
 }

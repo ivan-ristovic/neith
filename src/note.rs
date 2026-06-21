@@ -91,7 +91,7 @@ fn find_note_template(path: &Path) -> Option<String> {
 }
 
 fn default_note_template() -> String {
-    "# {{TITLE}}\n\n> Manually created note. Verify commands and references before using them on important systems.\n\nTask: {{QUERY}}\n\n```bash\n# command or snippet\n```\n\n## References\n\n- TODO: add reference\n".to_string()
+    "# {{TITLE}}\n\n> Manually created note. Verify commands and references before using them on important systems.\n\nTask: {{QUERY}}\n\n<!-- copy_begin -->\n```bash\n# command or snippet\n```\n<!-- copy_end -->\n\n## References\n\n- TODO: add reference\n".to_string()
 }
 
 fn sanitize_path_component(value: &str) -> String {

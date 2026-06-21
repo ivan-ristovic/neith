@@ -76,8 +76,27 @@ pinned = true
 command = "nvim"
 return_behavior = "resume"
 
+[clipboard]
+command = "xclip -sel clip"
+
 [ui]
 preview_cursor_percent = 50
+preview_syntax = "auto"
+preview_bat_args = []
+
+[ui.prompt]
+separator = ":"
+right_separator = ">"
+
+[ui.prompt.colors]
+fuzzy = "cyan"
+exact = "red"
+scope = "blue"
+filter = "green"
+separator = "dark-gray"
+marker = "dark-gray"
+query = "white"
+add = "cyan"
 ```
 
 Config fields:
@@ -87,9 +106,15 @@ Config fields:
 | `libraries[].path` | path | Library root. `~/` is expanded. |
 | `libraries[].alias` | string, optional | Display and filter name. Inferred when omitted. |
 | `libraries[].pinned` | bool, optional | Adds the library to the fast `Ctrl-L` scope cycle. |
-| `editor.command` | string | Command used by `Enter` and `neith add`. Defaults to `$EDITOR` or `vi`. |
+| `editor.command` | string | Command used by `Enter`, `Ctrl-O`, and `neith add`. Defaults to `$EDITOR` or `vi`. |
 | `editor.return_behavior` | `exit` or `resume` | Controls what happens after an editor exits from the TUI. |
+| `clipboard.command` | string, default empty | Overrides the built-in clipboard backends. Neith splits the command on whitespace and writes copied text to stdin. Example: `xclip -sel clip`. |
 | `ui.preview_cursor_percent` | integer, default `50` | Preferred cursor position in the visible preview pane while scrolling. `0` is top, `50` is middle, `100` is bottom. Values above `100` are clamped. |
+| `ui.preview_syntax` | `auto`, `plain`, or `bat`, default `auto` | Controls preview syntax highlighting. `auto` uses `bat` or `batcat` when found and falls back to plain preview. `plain` disables `bat`. `bat` explicitly tries `bat`/`batcat` and reports a status message if unavailable or invalid. |
+| `ui.preview_bat_args` | string array, default `[]` | Extra argv entries passed to `bat` after Neith's defaults and before `-- <path>`. Defaults supplied by Neith are `--color=always`, `--paging=never`, `--style=plain`, and `--wrap=never`. |
+| `ui.prompt.separator` | string, default `":"` | Separator between prompt mode, library scope, and source filter. Empty strings fall back to `":"`. |
+| `ui.prompt.right_separator` | string, default `">"` | Separator before the editable prompt text. Empty strings fall back to `">"`. |
+| `ui.prompt.colors.*` | color names | Prompt colors for `fuzzy`, `exact`, `scope`, `filter`, `separator`, `marker`, `query`, and `add`. Supported names include `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `gray`, `dark-gray`, `white`, `reset`, and `default`. |
 
 Library sources are appended in this order:
 
@@ -580,14 +605,14 @@ The TUI has four focus states:
 Prompt format:
 
 ```text
-<mode>:<library-scope>[:filter]> <query>
+<mode>:<library-scope>[:type]> <query>
 ```
 
 Examples:
 
 ```text
 F:all> awk print selected column
-E:all:names> awk.*print
+X:all:names> awk.*print
 F:devdocs:man> printf(3) format
 ```
 
@@ -596,9 +621,9 @@ Mode prefixes:
 | Prefix | Mode |
 | --- | --- |
 | `F` | Fuzzy |
-| `E` | Exact |
+| `X` | Exact |
 
-The filter segment is omitted for `all`. The library segment is `all` or a
+The type segment is omitted for `all`. The library segment is `all` or a
 library alias.
 
 Key behavior:
@@ -607,17 +632,20 @@ Key behavior:
 | --- | --- |
 | `Tab` | Switch results and preview focus; close popups. |
 | `Ctrl-A` | Add a new library entry from the current query. |
-| `Ctrl-K` | Toggle fuzzy/exact query mode. |
-| `Ctrl-R` | Toggle fuzzy refine over the current result list. |
-| `Ctrl-T` | Cycle result filters: `all`, `names`, `content`, `man`. |
+| `Ctrl-X` | Toggle fuzzy/exact query mode. |
+| `Ctrl-F` | Filter over the current result list. |
+| `Ctrl-T` | Cycle result types: `all`, `names`, `content`, `man`. |
 | `Ctrl-L` | Cycle pinned libraries, then open the library picker. |
 | `Ctrl-H` | Open or close help. |
+| `Ctrl-C` | Quick-copy the selected note payload. |
+| `Ctrl-O` | Open the selected result in a new tmux pane and exit Neith. |
 | `Ctrl-Q` | Quit from any mode. |
 | `Esc` | Cancel popup/copy/focus, or quit from results. |
 | `Enter` in results | Open the selected result in the configured editor. |
 | `Enter` in library picker | Select the highlighted library scope. |
 | `Enter` or `Space` in preview | Start copy mode, or copy the selected lines. |
 | `v` in preview copy mode | Move the selection anchor to the current line. |
+| `1-9` in quick-copy chooser | Copy the numbered code block. |
 | `Up/Down` | Move result selection, preview cursor, or picker selection. |
 | `j/k` | Move the preview cursor or picker selection. In results focus, `j` and `k` insert query text. |
 | `PageUp/PageDown` | Scroll preview text by a page without changing focus or moving the preview cursor. |
@@ -626,13 +654,13 @@ Key behavior:
 | Typing in results | Insert query text and refresh results. |
 | `Backspace` in results | Delete the previous query character and refresh results. |
 
-`Ctrl-R` result refine mode captures the currently displayed result list and the
-current query. It clears the prompt for a refine query, then uses
-`nucleo_matcher` to fuzzy-match that refine query against each captured result's
-display line, title, and snippet. An empty refine query shows all captured
-results. Pressing `Ctrl-R` again restores the captured query and result list.
-Changing query mode, source filter, or library scope while refine mode is active
-refreshes the captured base results and reapplies the refine query.
+`Ctrl-F` result filter mode captures the currently displayed result list and the
+current query. It clears the prompt for a filter query, then uses
+`nucleo_matcher` to fuzzy-match that filter query against each captured result's
+display line, title, and snippet. An empty filter query shows all captured
+results. Pressing `Ctrl-F` again restores the captured query and result list.
+Changing query mode, result type, or library scope while filter mode is active
+refreshes the captured base results and reapplies the filter query.
 
 ### Editor Flow
 
@@ -645,6 +673,12 @@ restores the terminal, and runs:
 
 The editor command is split on whitespace. It is executed directly, without a
 shell.
+
+`Ctrl-O` opens the selected result with the same editor command in a new tmux
+split pane. It targets `NEITH_TMUX_TARGET_PANE` when set, then falls back to
+`TMUX_PANE`. It uses `tmux split-window -v` when the target pane is wider than
+it is tall, otherwise `tmux split-window -h`. On success, Neith exits. The pane
+runs the editor, then leaves an interactive shell after the editor exits.
 
 `editor.return_behavior = "exit"` quits the TUI after the editor exits.
 
@@ -737,8 +771,8 @@ configured library if `neith-lib` is absent.
 
 The TUI uses the same note creation path. `Ctrl-A` opens an `add>` prompt with
 an inferred destination path. Edit the path, press `Enter` to create/open the
-entry, or press `Esc` to cancel. If result-refine mode is active, the base query
-is used for the note instead of the refine query.
+entry, or press `Esc` to cancel. If result-filter mode is active, the base query
+is used for the note instead of the filter query.
 
 Path inference:
 
@@ -748,8 +782,8 @@ Path inference:
 4. Use the full query as the note filename slug.
 
 Existing files are left unchanged. New notes include a generated title, the
-original task text, a starter code block, and a references section unless the
-target library provides a template.
+original task text, a starter `copy_begin` / `copy_end` region around a code
+block, and a references section unless the target library provides a template.
 
 Template lookup walks upward from the destination file and uses the first
 `.neith-note-template.md` found. Supported placeholders are:
@@ -763,14 +797,25 @@ Template lookup walks upward from the destination file and uses the first
 
 ## Clipboard
 
-Preview copy uses `copy_text`:
+Preview copy and quick-copy use `copy_text`:
 
-1. If `xsel` exists, write to `xsel --clipboard --input`.
-2. If inside tmux and `tmux` exists, run `tmux set-buffer -- <text>`.
-3. Succeed if any backend succeeds.
-4. Fail if no backend succeeds.
+1. If `clipboard.command` is set, split it on whitespace and write copied text to its stdin.
+2. If `wl-copy` exists, write to it.
+3. If `xclip` exists, write to `xclip -sel clip`.
+4. If `xsel` exists, write to `xsel --clipboard --input`.
+5. If inside tmux and `tmux` exists, run `tmux set-buffer -- <text>`.
+6. Succeed if any backend succeeds.
+7. Fail if no backend succeeds.
 
-`healthcheck` warns when neither backend is available.
+Quick-copy extracts note payloads in this order:
+
+1. Copy the first complete `<!-- copy_begin -->` / `<!-- copy_end -->` region.
+2. If that region contains exactly one fenced code block, copy only the block body.
+3. If no region exists and the note has one code block, copy that block body.
+4. If no region exists and the note has multiple code blocks, open a chooser.
+
+`healthcheck` warns when no backend is available or a configured clipboard
+command is missing.
 
 ## Development Invariants
 
@@ -876,5 +921,5 @@ and call the ranking path where possible so expected ordering stays explicit.
 | `status` shows stale files | Signature changed, file added, or manifest still contains removed paths. |
 | Live man results are absent | `man` or `col` missing, page unavailable, or query did not parse as a man query. |
 | Editor opens wrong command | `editor.command` whitespace splitting; no shell parsing is performed. |
-| Copy fails | No working `xsel` backend and no tmux backend. |
+| Copy fails | No working `wl-copy`, `xclip`, `xsel`, or tmux backend. |
 | JSON query is slow on first run | Indexes were missing or `--rebuild` forced an index pass before search. |

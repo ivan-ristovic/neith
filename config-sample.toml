@@ -1,0 +1,35 @@
+[[libraries]]
+path = "~/neith/neith-lib"
+alias = "neith-lib"
+pinned = true
+
+[[libraries]]
+path = "~/neith/neith-devdocs/generated"
+alias = "devdocs"
+pinned = true
+
+[editor]
+command = "nvim"
+return_behavior = "resume"
+
+[clipboard]
+command = "xclip -sel clip"
+
+[ui]
+preview_cursor_percent = 50
+preview_syntax = "auto"
+preview_bat_args = []
+
+[ui.prompt]
+separator = ":"
+right_separator = ">"
+
+[ui.prompt.colors]
+fuzzy = "cyan"
+exact = "red"
+scope = "blue"
+filter = "green"
+separator = "dark-gray"
+marker = "dark-gray"
+query = "white"
+add = "cyan"

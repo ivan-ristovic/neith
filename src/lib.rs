@@ -7,5 +7,6 @@ pub mod library;
 pub mod man;
 pub mod note;
 pub mod query;
+pub mod quick_copy;
 pub mod search;
 pub mod tui;

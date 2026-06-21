@@ -1,8 +1,12 @@
+use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use ansi_to_tui::IntoText as _;
 use anyhow::Result;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -14,17 +18,24 @@ use nucleo_matcher::{Config as FuzzyConfig, Matcher, Utf32Str};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::action::{copy_text, open_editor};
-use crate::config::{EditorReturn, RuntimeConfig};
+use crate::action::{copy_text, open_editor, open_editor_in_tmux_pane};
+use crate::config::{EditorReturn, PreviewSyntax, RuntimeConfig, UiConfig};
 use crate::indexer::{IndexManager, ensure_indexes};
 use crate::note;
 use crate::query::{LibraryScope, MatchMode, SearchRequest, SourceFilter, normalize_query};
+use crate::quick_copy::{self, CodeBlock, ExtractedCopy};
 use crate::search::{SearchEngine, SearchResult};
 
 const MOUSE_SCROLL_LINES: isize = 3;
+const BAT_PREVIEW_ARGS: &[&str] = &[
+    "--color=always",
+    "--paging=never",
+    "--style=plain",
+    "--wrap=never",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Focus {
@@ -32,6 +43,7 @@ enum Focus {
     Preview,
     LibrarySelector,
     AddEntry,
+    QuickCopy,
     Help,
 }
 
@@ -39,6 +51,7 @@ enum Focus {
 struct PreviewState {
     path: Option<PathBuf>,
     lines: Vec<String>,
+    syntax_lines: Vec<Line<'static>>,
     scroll: usize,
     cursor: usize,
     viewport_height: usize,
@@ -66,6 +79,13 @@ struct AddEntryState {
     path_cursor: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QuickCopyState {
+    blocks: Vec<CodeBlock>,
+    selected: usize,
+    return_focus: Focus,
+}
+
 pub struct App {
     config: RuntimeConfig,
     engine: SearchEngine,
@@ -85,7 +105,9 @@ pub struct App {
     library_selector_index: usize,
     result_refine: Option<ResultRefineState>,
     add_entry: Option<AddEntryState>,
+    quick_copy: Option<QuickCopyState>,
     pending_editor: Option<EditorRequest>,
+    tmux_pane_opener: fn(&str, &Path, Option<usize>) -> Result<()>,
     should_quit: bool,
 }
 
@@ -116,7 +138,9 @@ impl App {
             library_selector_index: 0,
             result_refine: None,
             add_entry: None,
+            quick_copy: None,
             pending_editor: None,
+            tmux_pane_opener: open_editor_in_tmux_pane,
             should_quit: false,
         };
         app.refresh_results();
@@ -195,11 +219,23 @@ impl App {
             return;
         }
         let text = fs::read_to_string(&result.path).unwrap_or_default();
+        let lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+        let syntax_lines =
+            match load_syntax_preview_lines(&result.path, lines.len(), &self.config.app.ui) {
+                Ok(lines) => lines.unwrap_or_default(),
+                Err(err) => {
+                    if self.config.app.ui.preview_syntax == PreviewSyntax::Bat {
+                        self.status = format!("bat preview failed: {err}");
+                    }
+                    Vec::new()
+                }
+            };
         let cursor = result.line.saturating_sub(1);
         let viewport_height = self.preview.viewport_height;
         self.preview = PreviewState {
             path: Some(result.path.clone()),
-            lines: text.lines().map(str::to_string).collect(),
+            lines,
+            syntax_lines,
             scroll: 0,
             cursor,
             viewport_height,
@@ -402,12 +438,101 @@ impl App {
             .unwrap_or(self.preview.cursor)
             .max(self.preview.cursor);
         let text = self.preview.lines[start..=end].join("\n");
-        match copy_text(&text) {
+        match copy_text(&text, &self.config.app.clipboard.command) {
             Ok(()) => self.status = format!("copied lines {}-{}", start + 1, end + 1),
             Err(err) => self.status = format!("copy failed: {err}"),
         }
         self.preview.copy_mode = false;
         self.preview.anchor = None;
+    }
+
+    fn begin_quick_copy(&mut self) {
+        let Some(result) = self.results.get(self.selected) else {
+            self.status = "quick-copy failed: no result selected".to_string();
+            return;
+        };
+        if result.source_kind != "note"
+            || result.path.extension().and_then(|ext| ext.to_str()) != Some("md")
+        {
+            self.status = "quick-copy supports markdown notes only".to_string();
+            return;
+        }
+
+        let text = match fs::read_to_string(&result.path) {
+            Ok(text) => text,
+            Err(err) => {
+                self.status = format!("quick-copy failed: {err}");
+                return;
+            }
+        };
+        match quick_copy::extract(&text) {
+            Ok(ExtractedCopy::Payload(text)) => self.copy_quick_copy_text(&text, "quick-copy"),
+            Ok(ExtractedCopy::CodeBlocks(blocks)) => {
+                self.quick_copy = Some(QuickCopyState {
+                    blocks,
+                    selected: 0,
+                    return_focus: self.focus,
+                });
+                self.focus = Focus::QuickCopy;
+                self.status =
+                    "quick-copy: choose block, 1-9 copy, Enter copy, Esc cancel".to_string();
+            }
+            Err(err) => {
+                self.status = format!("quick-copy failed: {err}");
+            }
+        }
+    }
+
+    fn close_quick_copy(&mut self) {
+        let return_focus = self
+            .quick_copy
+            .as_ref()
+            .map(|state| state.return_focus)
+            .unwrap_or(Focus::Results);
+        self.quick_copy = None;
+        self.focus = return_focus;
+    }
+
+    fn quick_copy_next(&mut self) {
+        let Some(state) = &mut self.quick_copy else {
+            return;
+        };
+        if state.selected + 1 < state.blocks.len() {
+            state.selected += 1;
+        }
+    }
+
+    fn quick_copy_prev(&mut self) {
+        let Some(state) = &mut self.quick_copy else {
+            return;
+        };
+        state.selected = state.selected.saturating_sub(1);
+    }
+
+    fn copy_selected_quick_copy_block(&mut self) {
+        let Some(state) = &self.quick_copy else {
+            return;
+        };
+        self.copy_quick_copy_block(state.selected);
+    }
+
+    fn copy_quick_copy_block(&mut self, index: usize) {
+        let Some(state) = &self.quick_copy else {
+            return;
+        };
+        let Some(block) = state.blocks.get(index) else {
+            return;
+        };
+        let text = block.body.clone();
+        self.close_quick_copy();
+        self.copy_quick_copy_text(&text, &format!("code block {}", index + 1));
+    }
+
+    fn copy_quick_copy_text(&mut self, text: &str, label: &str) {
+        match copy_text(text, &self.config.app.clipboard.command) {
+            Ok(()) => self.status = format!("copied {label}"),
+            Err(err) => self.status = format!("copy failed: {err}"),
+        }
     }
 
     fn toggle_help(&mut self) {
@@ -446,7 +571,7 @@ impl App {
             self.query = state.base_query;
             self.query_cursor = state.base_query_cursor.min(self.query.len());
             self.results = state.base_results;
-            self.status = "result refine off".to_string();
+            self.status = "result filter off".to_string();
             self.finish_result_refresh();
             return;
         }
@@ -462,7 +587,7 @@ impl App {
         });
         self.query.clear();
         self.query_cursor = 0;
-        self.status = format!("result refine: fuzzy over {base_count} results; Ctrl-R return");
+        self.status = format!("result filter: fuzzy over {base_count} results; Ctrl-F return");
         self.refresh_results();
     }
 
@@ -663,6 +788,24 @@ impl App {
         });
     }
 
+    fn request_open_selected_result_in_tmux_pane(&mut self) {
+        let Some(result) = self.results.get(self.selected) else {
+            self.status = "no result selected".to_string();
+            return;
+        };
+        let path = result.path.clone();
+        let line = (result.line > 0).then_some(result.line);
+        match (self.tmux_pane_opener)(&self.config.app.editor.command, &path, line) {
+            Ok(()) => {
+                self.status = format!("opened {} in tmux pane", path.display());
+                self.should_quit = true;
+            }
+            Err(err) => {
+                self.status = format!("tmux pane open failed: {err:#}");
+            }
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -686,6 +829,10 @@ impl App {
             return self.handle_add_entry_key(key);
         }
 
+        if self.focus == Focus::QuickCopy {
+            return self.handle_quick_copy_key(key);
+        }
+
         if self.handle_preview_scroll_key(key) {
             return Ok(());
         }
@@ -699,7 +846,19 @@ impl App {
                     self.begin_add_entry();
                     return Ok(());
                 }
-                KeyCode::Char('k') | KeyCode::Char('K') => {
+                KeyCode::Char('c') | KeyCode::Char('C')
+                    if matches!(self.focus, Focus::Results | Focus::Preview) =>
+                {
+                    self.begin_quick_copy();
+                    return Ok(());
+                }
+                KeyCode::Char('o') | KeyCode::Char('O')
+                    if matches!(self.focus, Focus::Results | Focus::Preview) =>
+                {
+                    self.request_open_selected_result_in_tmux_pane();
+                    return Ok(());
+                }
+                KeyCode::Char('x') | KeyCode::Char('X') => {
                     self.toggle_query_mode();
                     return Ok(());
                 }
@@ -708,11 +867,8 @@ impl App {
                     self.refresh_after_search_context_change();
                     return Ok(());
                 }
-                KeyCode::Char('r') | KeyCode::Char('R') => {
-                    self.toggle_result_refine();
-                    return Ok(());
-                }
                 KeyCode::Char('f') | KeyCode::Char('F') => {
+                    self.toggle_result_refine();
                     return Ok(());
                 }
                 KeyCode::Char('l') | KeyCode::Char('L') => {
@@ -728,6 +884,7 @@ impl App {
             Focus::Preview => self.handle_preview_key(key),
             Focus::LibrarySelector => self.handle_library_selector_key(key),
             Focus::AddEntry => self.handle_add_entry_key(key),
+            Focus::QuickCopy => self.handle_quick_copy_key(key),
             Focus::Help => self.handle_help_key(key),
         }
     }
@@ -828,6 +985,36 @@ impl App {
             KeyCode::Enter => self.choose_library_from_selector(),
             KeyCode::Up | KeyCode::Char('k') => self.library_selector_prev(),
             KeyCode::Down | KeyCode::Char('j') => self.library_selector_next(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_quick_copy_key(&mut self, key: KeyEvent) -> Result<()> {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Ok(());
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Tab => {
+                self.close_quick_copy();
+                self.status = "quick-copy cancelled".to_string();
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.copy_selected_quick_copy_block(),
+            KeyCode::Up | KeyCode::Char('k') => self.quick_copy_prev(),
+            KeyCode::Down | KeyCode::Char('j') => self.quick_copy_next(),
+            KeyCode::Char(ch) => {
+                if let Some(index) = ch
+                    .to_digit(10)
+                    .and_then(|digit| usize::try_from(digit).ok())
+                    .and_then(|digit| digit.checked_sub(1))
+                    .filter(|index| *index < 9)
+                {
+                    self.copy_quick_copy_block(index);
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -964,6 +1151,9 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.focus == Focus::LibrarySelector {
         draw_library_selector(frame, centered_rect(70, 70, area), app);
     }
+    if app.focus == Focus::QuickCopy {
+        draw_quick_copy(frame, centered_rect(82, 64, area), app);
+    }
     if app.focus == Focus::Help {
         draw_help(frame, centered_rect(78, 78, area));
     }
@@ -990,28 +1180,22 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let mut items = Vec::new();
     for (idx, line) in app.preview.lines[start..end].iter().enumerate() {
         let absolute = start + idx;
+        let syntax_line = app.preview.syntax_lines.get(absolute);
         let line_has_match = line_has_highlight(line, &terms);
-        let mut style = Style::default();
-        if app.focus == Focus::Preview
+        let is_copy_selected = app.focus == Focus::Preview
             && app.preview.copy_mode
             && absolute >= range_start
-            && absolute <= range_end
-        {
-            style = style.bg(Color::DarkGray).fg(Color::White);
-        } else if app.focus == Focus::Preview && absolute == app.preview.cursor {
-            style = style.add_modifier(Modifier::REVERSED);
-        } else if line_has_match {
-            style = style.fg(Color::Cyan);
-        }
-        items.push(
-            ListItem::new(highlighted_preview_line(
-                absolute + 1,
-                line,
-                &terms,
-                line_has_match,
-            ))
-            .style(style),
-        );
+            && absolute <= range_end;
+        let is_cursor = app.focus == Focus::Preview && absolute == app.preview.cursor;
+        items.push(ListItem::new(highlighted_preview_line(
+            absolute + 1,
+            line,
+            syntax_line,
+            &terms,
+            line_has_match,
+            is_cursor,
+            is_copy_selected,
+        )));
     }
     if items.is_empty() {
         items.push(ListItem::new("No preview"));
@@ -1029,11 +1213,8 @@ fn draw_results(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Constraint::Min(1),
         ])
         .split(area);
-    let prompt = prompt_text(app);
-    frame.render_widget(
-        Paragraph::new(prompt).style(Style::default().fg(Color::Cyan)),
-        chunks[0],
-    );
+    let prompt = prompt_line(app);
+    frame.render_widget(Paragraph::new(prompt), chunks[0]);
     if matches!(app.focus, Focus::Results | Focus::AddEntry) {
         frame.set_cursor_position(prompt_cursor_position(app, chunks[0]));
     }
@@ -1041,9 +1222,12 @@ fn draw_results(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         match app.focus {
             Focus::AddEntry => "Enter create/open | Esc cancel | Left/Right edit path | C-Q quit",
             Focus::Preview => {
-                "Tab results | Enter/Space copy | C-A add | C-K exact/fuzzy | C-R refine | C-T filter | C-L lib | C-H help | C-Q quit"
+                "Tab results | Enter copy | C-C copy | C-A add | C-X exact | C-F filter | C-T type | C-L lib | C-H help"
             }
-            _ => "Tab preview | Enter open | C-A add | C-K exact/fuzzy | C-R refine | C-T filter | C-L lib | C-H help | C-Q quit",
+            Focus::QuickCopy => "1-9 copy | Enter copy | Up/Down select | Esc cancel | C-Q quit",
+            _ => {
+                "Tab preview | Enter open | C-C copy | C-A add | C-X exact | C-F filter | C-T type | C-L lib | C-H help"
+            }
         }
         .to_string()
     } else {
@@ -1069,9 +1253,62 @@ fn draw_results(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_stateful_widget(list, chunks[2], &mut state);
 }
 
+#[cfg(test)]
 fn prompt_text(app: &App) -> String {
     let (prefix, text, _) = prompt_parts(app);
     format!("{prefix}{text}")
+}
+
+fn prompt_line(app: &App) -> Line<'static> {
+    let colors = &app.config.app.ui.prompt.colors;
+    if let Some(add_entry) = &app.add_entry {
+        let right_separator = prompt_right_separator(app);
+        return Line::from(vec![
+            Span::styled("add", prompt_color_style(&colors.add, Color::Cyan)),
+            Span::styled(
+                format!("{right_separator} "),
+                prompt_color_style(&colors.marker, Color::DarkGray),
+            ),
+            Span::styled(
+                add_entry.path_text.clone(),
+                prompt_color_style(&colors.query, Color::White),
+            ),
+        ]);
+    }
+
+    let mode = match app.mode {
+        MatchMode::Exact => ("X", &colors.exact, Color::Red),
+        MatchMode::Fuzzy => ("F", &colors.fuzzy, Color::Cyan),
+    };
+    let separator = prompt_separator(app);
+    let scope = app.current_library_scope().label().to_string();
+    let mut spans = vec![
+        Span::styled(mode.0, prompt_color_style(mode.1, mode.2)),
+        Span::styled(
+            separator.clone(),
+            prompt_color_style(&colors.separator, Color::DarkGray),
+        ),
+        Span::styled(scope, prompt_color_style(&colors.scope, Color::Blue)),
+    ];
+    if let Some(filter) = app.filter.label() {
+        spans.push(Span::styled(
+            separator,
+            prompt_color_style(&colors.separator, Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            filter,
+            prompt_color_style(&colors.filter, Color::Green),
+        ));
+    }
+    spans.push(Span::styled(
+        format!("{} ", prompt_right_separator(app)),
+        prompt_color_style(&colors.marker, Color::DarkGray),
+    ));
+    spans.push(Span::styled(
+        app.query.clone(),
+        prompt_color_style(&colors.query, Color::White),
+    ));
+    Line::from(spans)
 }
 
 fn prompt_parts(app: &App) -> (String, String, usize) {
@@ -1084,16 +1321,60 @@ fn prompt_parts(app: &App) -> (String, String, usize) {
     }
 
     let mode = match app.mode {
-        MatchMode::Exact => "E",
+        MatchMode::Exact => "X",
         MatchMode::Fuzzy => "F",
     };
     let scope = app.current_library_scope();
-    let mut prefix = format!("{mode}:{}", scope.label());
+    let separator = prompt_separator(app);
+    let mut prefix = format!("{mode}{separator}{}", scope.label());
     if let Some(filter) = app.filter.label() {
-        prefix.push(':');
+        prefix.push_str(&separator);
         prefix.push_str(filter);
     }
-    (format!("{prefix}> "), app.query.clone(), app.query_cursor)
+    (
+        format!("{prefix}{} ", prompt_right_separator(app)),
+        app.query.clone(),
+        app.query_cursor,
+    )
+}
+
+fn prompt_separator(app: &App) -> String {
+    let separator = app.config.app.ui.prompt.separator.trim();
+    if separator.is_empty() {
+        ":".to_string()
+    } else {
+        separator.to_string()
+    }
+}
+
+fn prompt_right_separator(app: &App) -> String {
+    let separator = app.config.app.ui.prompt.right_separator.trim();
+    if separator.is_empty() {
+        ">".to_string()
+    } else {
+        separator.to_string()
+    }
+}
+
+fn prompt_color_style(value: &str, fallback: Color) -> Style {
+    Style::default().fg(prompt_color(value, fallback))
+}
+
+fn prompt_color(value: &str, fallback: Color) -> Color {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "gray" | "grey" => Color::Gray,
+        "dark-gray" | "dark-grey" | "darkgray" | "darkgrey" => Color::DarkGray,
+        "white" => Color::White,
+        "reset" | "default" => Color::Reset,
+        _ => fallback,
+    }
 }
 
 fn prompt_cursor_position(app: &App, area: Rect) -> (u16, u16) {
@@ -1209,22 +1490,202 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
+fn load_syntax_preview_lines(
+    path: &Path,
+    raw_line_count: usize,
+    ui: &UiConfig,
+) -> std::result::Result<Option<Vec<Line<'static>>>, String> {
+    if ui.preview_syntax == PreviewSyntax::Plain {
+        return Ok(None);
+    }
+    let Some(program) = resolve_bat_command() else {
+        return if ui.preview_syntax == PreviewSyntax::Bat {
+            Err("bat or batcat was not found on PATH".to_string())
+        } else {
+            Ok(None)
+        };
+    };
+    run_bat_preview(&program, path, raw_line_count, &ui.preview_bat_args).map(Some)
+}
+
+fn resolve_bat_command() -> Option<PathBuf> {
+    let path = env::var_os("PATH");
+    resolve_bat_command_from_path(path.as_deref())
+}
+
+fn resolve_bat_command_from_path(path: Option<&OsStr>) -> Option<PathBuf> {
+    ["bat", "batcat"]
+        .into_iter()
+        .find_map(|command| find_command_in_path(command, path))
+}
+
+fn find_command_in_path(command: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    let path = path?;
+    env::split_paths(path)
+        .map(|dir| dir.join(command))
+        .find(|candidate| candidate.is_file())
+}
+
+fn run_bat_preview(
+    program: &Path,
+    path: &Path,
+    raw_line_count: usize,
+    user_args: &[String],
+) -> std::result::Result<Vec<Line<'static>>, String> {
+    let output = Command::new(program)
+        .args(bat_preview_args(path, user_args))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(format!("bat exited with {}", output.status));
+    }
+    parse_bat_preview_output(&output.stdout, raw_line_count)
+}
+
+fn bat_preview_args(path: &Path, user_args: &[String]) -> Vec<OsString> {
+    let mut args = BAT_PREVIEW_ARGS
+        .iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    args.extend(user_args.iter().map(OsString::from));
+    args.push(OsString::from("--"));
+    args.push(path.as_os_str().to_os_string());
+    args
+}
+
+fn parse_bat_preview_output(
+    bytes: &[u8],
+    raw_line_count: usize,
+) -> std::result::Result<Vec<Line<'static>>, String> {
+    let text = bytes.into_text().map_err(|err| err.to_string())?;
+    if text.lines.len() != raw_line_count {
+        return Err(format!(
+            "bat output line count {} did not match source line count {}",
+            text.lines.len(),
+            raw_line_count
+        ));
+    }
+    Ok(text.lines)
+}
+
 fn highlighted_preview_line(
     line_number: usize,
     text: &str,
+    syntax_line: Option<&Line<'_>>,
     terms: &[String],
     line_has_match: bool,
+    is_cursor: bool,
+    is_copy_selected: bool,
 ) -> Line<'static> {
-    let number_style = if line_has_match {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+    let number_style = preview_line_number_style(line_has_match, is_cursor, is_copy_selected);
     let mut spans = vec![Span::styled(format!("{line_number:>5} "), number_style)];
-    spans.extend(highlighted_text_spans(text, terms));
+    if let Some(syntax_line) = syntax_line {
+        spans.extend(highlighted_styled_spans(&syntax_line.spans, terms));
+    } else {
+        spans.extend(highlighted_text_spans(text, terms));
+    }
     Line::from(spans)
+}
+
+fn preview_line_number_style(
+    line_has_match: bool,
+    is_cursor: bool,
+    is_copy_selected: bool,
+) -> Style {
+    if is_copy_selected {
+        return Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+    }
+    if is_cursor {
+        return Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+    }
+    if line_has_match {
+        return Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+    }
+    Style::default().fg(Color::DarkGray)
+}
+
+fn highlighted_styled_spans(source: &[Span<'_>], terms: &[String]) -> Vec<Span<'static>> {
+    if terms.is_empty() {
+        return owned_spans(source);
+    }
+
+    let text = source
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let lower = text.to_ascii_lowercase();
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let Some((start, end)) = next_highlight_range(&lower, cursor, terms) else {
+            break;
+        };
+        ranges.push((start, end));
+        cursor = end;
+    }
+    if ranges.is_empty() {
+        return owned_spans(source);
+    }
+
+    let mut spans = Vec::new();
+    let mut range_idx = 0;
+    let mut absolute = 0;
+    for span in source {
+        let content = span.content.as_ref();
+        let span_start = absolute;
+        let span_end = span_start + content.len();
+        let mut local = 0;
+        while local < content.len() {
+            let position = span_start + local;
+            while range_idx < ranges.len() && ranges[range_idx].1 <= position {
+                range_idx += 1;
+            }
+            if range_idx < ranges.len()
+                && ranges[range_idx].0 <= position
+                && position < ranges[range_idx].1
+            {
+                let end = ranges[range_idx].1.min(span_end);
+                let local_end = local + (end - position);
+                spans.push(Span::styled(
+                    content[local..local_end].to_string(),
+                    query_match_style(span.style),
+                ));
+                local = local_end;
+            } else {
+                let end = ranges
+                    .get(range_idx)
+                    .map(|(start, _)| (*start).min(span_end))
+                    .unwrap_or(span_end);
+                let local_end = local + (end - position);
+                spans.push(Span::styled(
+                    content[local..local_end].to_string(),
+                    span.style,
+                ));
+                local = local_end;
+            }
+        }
+        absolute = span_end;
+    }
+    spans
+}
+
+fn owned_spans(source: &[Span<'_>]) -> Vec<Span<'static>> {
+    source
+        .iter()
+        .map(|span| Span::styled(span.content.to_string(), span.style))
+        .collect()
+}
+
+fn query_match_style(style: Style) -> Style {
+    style.fg(Color::Yellow).add_modifier(Modifier::BOLD)
 }
 
 fn highlighted_text_spans(text: &str, terms: &[String]) -> Vec<Span<'static>> {
@@ -1313,6 +1774,71 @@ fn draw_library_selector(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+fn draw_quick_copy(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    frame.render_widget(Clear, area);
+    let Some(state) = &app.quick_copy else {
+        return;
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(area);
+    let items = state
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| ListItem::new(quick_copy_block_label(index, block)))
+        .collect::<Vec<_>>();
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selected));
+    let list = List::new(items)
+        .block(Block::bordered().title(" Quick Copy "))
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(list, chunks[0], &mut list_state);
+
+    let selected = state.blocks.get(state.selected);
+    let preview_title = selected
+        .map(|block| {
+            let language = if block.language.is_empty() {
+                "text"
+            } else {
+                &block.language
+            };
+            format!(" Block {} ({language}) ", state.selected + 1)
+        })
+        .unwrap_or_else(|| " Block ".to_string());
+    let preview = selected.map(|block| block.body.clone()).unwrap_or_default();
+    let paragraph = Paragraph::new(preview)
+        .block(Block::bordered().title(preview_title))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, chunks[1]);
+}
+
+fn quick_copy_block_label(index: usize, block: &CodeBlock) -> Line<'static> {
+    let shortcut = if index < 9 {
+        format!("{}", index + 1)
+    } else {
+        "-".to_string()
+    };
+    let language = if block.language.is_empty() {
+        "text"
+    } else {
+        &block.language
+    };
+    let summary = quick_copy::first_non_empty_line(&block.body).unwrap_or("(empty)");
+    Line::from(vec![
+        Span::styled(
+            format!("{shortcut:<2}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("{language:<10}"), Style::default().fg(Color::Cyan)),
+        Span::raw(summary.to_string()),
+    ])
+}
+
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Clear, area);
     let items = help_lines()
@@ -1343,9 +1869,12 @@ fn help_lines() -> &'static [(&'static str, &'static str)] {
         ("Esc", "cancel popup/copy/focus; quit from results"),
         ("Tab", "switch results and preview focus; close popups"),
         ("Ctrl-A", "add a new library entry from the current query"),
-        ("Ctrl-K", "toggle exact/fuzzy query mode"),
-        ("Ctrl-R", "toggle fuzzy refine over current results"),
-        ("Ctrl-T", "cycle result filter: all, names, content, man"),
+        ("Ctrl-C", "quick-copy the selected note payload"),
+        ("Ctrl-O", "open selected result in a new tmux pane"),
+        ("Ctrl-W", "delete previous query word"),
+        ("Ctrl-X", "toggle exact/fuzzy query mode"),
+        ("Ctrl-F", "filter over current results"),
+        ("Ctrl-T", "cycle result type: all, names, content, man"),
         ("Ctrl-L", "cycle pinned libraries or open library picker"),
         ("typing", "edit the query in results mode"),
         ("Backspace", "delete query text in results mode"),
@@ -1365,6 +1894,7 @@ fn help_lines() -> &'static [(&'static str, &'static str)] {
             "v",
             "copy mode: move selection anchor to current preview line",
         ),
+        ("1-9", "quick-copy chooser: copy numbered code block"),
         (
             "all",
             "first library picker row searches all configured libraries",
@@ -1394,8 +1924,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, EditorConfig, UiConfig};
+    use crate::config::{AppConfig, ClipboardConfig, EditorConfig, UiConfig};
     use crate::library::Library;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TmuxOpenCall {
+        editor: String,
+        path: PathBuf,
+        line: Option<usize>,
+    }
+
+    static TMUX_OPEN_CALL: Mutex<Option<TmuxOpenCall>> = Mutex::new(None);
 
     fn test_app() -> App {
         test_app_with_libraries(Vec::new())
@@ -1410,6 +1950,7 @@ mod tests {
                     command: "true".to_string(),
                     return_behavior: EditorReturn::Resume,
                 },
+                clipboard: ClipboardConfig::default(),
                 ui: UiConfig::default(),
             },
             libraries,
@@ -1430,6 +1971,19 @@ mod tests {
 
     fn shift_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    fn record_tmux_pane_open(editor: &str, path: &Path, line: Option<usize>) -> Result<()> {
+        *TMUX_OPEN_CALL.lock().unwrap() = Some(TmuxOpenCall {
+            editor: editor.to_string(),
+            path: path.to_path_buf(),
+            line,
+        });
+        Ok(())
+    }
+
+    fn fail_tmux_pane_open(_: &str, _: &Path, _: Option<usize>) -> Result<()> {
+        anyhow::bail!("tmux missing")
     }
 
     fn search_result(path: &str, line: usize) -> SearchResult {
@@ -1453,6 +2007,121 @@ mod tests {
     }
 
     #[test]
+    fn bat_preview_args_append_user_args_before_path_separator() {
+        let args = bat_preview_args(
+            Path::new("/tmp/example.md"),
+            &[
+                "--theme=TwoDark".to_string(),
+                "--italic-text=always".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--color=always"),
+                OsString::from("--paging=never"),
+                OsString::from("--style=plain"),
+                OsString::from("--wrap=never"),
+                OsString::from("--theme=TwoDark"),
+                OsString::from("--italic-text=always"),
+                OsString::from("--"),
+                OsString::from("/tmp/example.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bat_command_resolution_prefers_bat_over_batcat() {
+        let temp = tempfile::tempdir().unwrap();
+        let bat = temp.path().join("bat");
+        let batcat = temp.path().join("batcat");
+        std::fs::write(&bat, "").unwrap();
+        std::fs::write(&batcat, "").unwrap();
+        let path = std::env::join_paths([temp.path()]).unwrap();
+
+        assert_eq!(
+            resolve_bat_command_from_path(Some(path.as_os_str())),
+            Some(bat)
+        );
+    }
+
+    #[test]
+    fn bat_command_resolution_falls_back_to_batcat() {
+        let temp = tempfile::tempdir().unwrap();
+        let batcat = temp.path().join("batcat");
+        std::fs::write(&batcat, "").unwrap();
+        let path = std::env::join_paths([temp.path()]).unwrap();
+
+        assert_eq!(
+            resolve_bat_command_from_path(Some(path.as_os_str())),
+            Some(batcat)
+        );
+    }
+
+    #[test]
+    fn bat_preview_output_parses_ansi_styles() {
+        let lines = parse_bat_preview_output(b"\x1b[31mlet\x1b[0m value", 1).unwrap();
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "let");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(lines[0].spans[1].content.as_ref(), " value");
+    }
+
+    #[test]
+    fn bat_preview_output_rejects_line_count_mismatch() {
+        let err = parse_bat_preview_output(b"one\ntwo", 1).unwrap_err();
+
+        assert!(err.contains("line count 2"));
+    }
+
+    #[test]
+    fn preview_line_overlays_query_match_on_syntax_spans() {
+        let syntax = Line::from(vec![
+            Span::styled("let", Style::default().fg(Color::Red)),
+            Span::styled(" value", Style::default().fg(Color::Blue)),
+        ]);
+        let line = highlighted_preview_line(
+            3,
+            "let value",
+            Some(&syntax),
+            &["let".to_string()],
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(line.spans[0].content.as_ref(), "    3 ");
+        assert_eq!(line.spans[1].content.as_ref(), "let");
+        assert_eq!(line.spans[1].style.fg, Some(Color::Yellow));
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[2].content.as_ref(), " value");
+        assert_eq!(line.spans[2].style.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn preview_line_marks_copy_selection_in_gutter_only() {
+        let line = highlighted_preview_line(9, "plain text", None, &[], false, true, true);
+
+        assert_eq!(line.spans[0].style.fg, Some(Color::Green));
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[0].style.bg, None);
+        assert_eq!(line.spans[1].content.as_ref(), "plain text");
+        assert_eq!(line.spans[1].style.bg, None);
+    }
+
+    #[test]
+    fn preview_line_marks_cursor_in_gutter_only() {
+        let line = highlighted_preview_line(9, "plain text", None, &[], false, true, false);
+
+        assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[0].style.bg, None);
+        assert_eq!(line.spans[1].style.bg, None);
+    }
+
+    #[test]
     fn enter_in_results_requests_editor_open() {
         let mut app = test_app();
         app.results = vec![search_result("/tmp/example.md", 7)];
@@ -1467,6 +2136,41 @@ mod tests {
                 line: Some(7),
             })
         );
+    }
+
+    #[test]
+    fn ctrl_o_opens_selected_result_in_tmux_pane_and_quits() {
+        *TMUX_OPEN_CALL.lock().unwrap() = None;
+        let mut app = test_app();
+        app.config.app.editor.command = "nvim --clean".to_string();
+        app.tmux_pane_opener = record_tmux_pane_open;
+        app.results = vec![search_result("/tmp/example.md", 7)];
+
+        app.handle_key(ctrl_key('o')).unwrap();
+
+        assert!(app.should_quit);
+        assert_eq!(app.pending_editor, None);
+        assert_eq!(
+            *TMUX_OPEN_CALL.lock().unwrap(),
+            Some(TmuxOpenCall {
+                editor: "nvim --clean".to_string(),
+                path: PathBuf::from("/tmp/example.md"),
+                line: Some(7),
+            })
+        );
+    }
+
+    #[test]
+    fn ctrl_o_failure_keeps_neith_open() {
+        let mut app = test_app();
+        app.tmux_pane_opener = fail_tmux_pane_open;
+        app.results = vec![search_result("/tmp/example.md", 7)];
+
+        app.handle_key(ctrl_key('o')).unwrap();
+
+        assert!(!app.should_quit);
+        assert_eq!(app.pending_editor, None);
+        assert_eq!(app.status, "tmux pane open failed: tmux missing");
     }
 
     #[test]
@@ -1504,12 +2208,53 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_on_multi_block_note_opens_quick_copy_chooser() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("example.md");
+        std::fs::write(
+            &path,
+            "# Example\n\n```bash\nfirst\n```\n\n```bash\nsecond\n```\n",
+        )
+        .unwrap();
+        let mut app = test_app();
+        app.results = vec![search_result(path.to_str().unwrap(), 1)];
+
+        app.handle_key(ctrl_key('c')).unwrap();
+
+        assert_eq!(app.focus, Focus::QuickCopy);
+        let quick_copy = app.quick_copy.as_ref().unwrap();
+        assert_eq!(quick_copy.blocks.len(), 2);
+        assert_eq!(quick_copy.selected, 0);
+
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        assert_eq!(app.quick_copy.as_ref().unwrap().selected, 1);
+
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.focus, Focus::Results);
+        assert_eq!(app.quick_copy, None);
+        assert_eq!(app.status, "quick-copy cancelled");
+    }
+
+    #[test]
+    fn ctrl_c_on_non_note_result_reports_status() {
+        let mut app = test_app();
+        let mut result = search_result("/tmp/example.txt", 1);
+        result.source_kind = "man".to_string();
+        app.results = vec![result];
+
+        app.handle_key(ctrl_key('c')).unwrap();
+
+        assert_eq!(app.focus, Focus::Results);
+        assert_eq!(app.status, "quick-copy supports markdown notes only");
+    }
+
+    #[test]
     fn prompt_omits_all_filter() {
         let mut app = test_app();
         app.mode = MatchMode::Exact;
         app.query = "input query".to_string();
 
-        assert_eq!(prompt_text(&app), "E:all> input query");
+        assert_eq!(prompt_text(&app), "X:all> input query");
     }
 
     #[test]
@@ -1524,17 +2269,71 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_k_toggles_mode_only() {
+    fn prompt_uses_configured_separator() {
+        let mut app = test_app();
+        app.query = "input query".to_string();
+        app.config.app.ui.prompt.separator = "/".to_string();
+
+        assert_eq!(prompt_text(&app), "F/all> input query");
+    }
+
+    #[test]
+    fn prompt_uses_configured_right_separator() {
+        let mut app = test_app();
+        app.query = "input query".to_string();
+        app.config.app.ui.prompt.right_separator = "|".to_string();
+
+        assert_eq!(prompt_text(&app), "F:all| input query");
+    }
+
+    #[test]
+    fn prompt_line_colors_query_white() {
+        let mut app = test_app();
+        app.query = "input query".to_string();
+
+        let line = prompt_line(&app);
+        let query = line.spans.last().unwrap();
+
+        assert_eq!(query.content.as_ref(), "input query");
+        assert_eq!(query.style.fg, Some(Color::White));
+    }
+
+    #[test]
+    fn prompt_line_colors_exact_and_filter_tokens() {
+        let mut app = test_app();
+        app.mode = MatchMode::Exact;
+        app.filter = SourceFilter::Names;
+        app.query = "input query".to_string();
+
+        let line = prompt_line(&app);
+
+        assert_eq!(line.spans[0].content.as_ref(), "X");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Red));
+        assert_eq!(line.spans[4].content.as_ref(), "names");
+        assert_eq!(line.spans[4].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn empty_prompt_separators_fall_back_to_defaults() {
+        let mut app = test_app();
+        app.config.app.ui.prompt.separator.clear();
+        app.config.app.ui.prompt.right_separator.clear();
+
+        assert_eq!(prompt_text(&app), "F:all> ");
+    }
+
+    #[test]
+    fn ctrl_x_toggles_mode_only() {
         let mut app = test_app();
         app.mode = MatchMode::Fuzzy;
         app.filter = SourceFilter::Names;
 
-        app.handle_key(ctrl_key('k')).unwrap();
+        app.handle_key(ctrl_key('x')).unwrap();
 
         assert_eq!(app.mode, MatchMode::Exact);
         assert_eq!(app.filter, SourceFilter::Names);
 
-        app.handle_key(ctrl_key('k')).unwrap();
+        app.handle_key(ctrl_key('x')).unwrap();
 
         assert_eq!(app.mode, MatchMode::Fuzzy);
         assert_eq!(app.filter, SourceFilter::Names);
@@ -1614,7 +2413,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_r_toggles_result_refine_without_changing_query_mode() {
+    fn ctrl_f_toggles_result_filter_without_changing_query_mode() {
         let mut app = test_app();
         app.mode = MatchMode::Fuzzy;
         app.query = "awk".to_string();
@@ -1624,13 +2423,13 @@ mod tests {
             search_result_with_title("/tmp/archive.md", 1, "Archive Logs"),
         ];
 
-        app.handle_key(ctrl_key('r')).unwrap();
+        app.handle_key(ctrl_key('f')).unwrap();
 
         assert_eq!(app.mode, MatchMode::Fuzzy);
         assert_eq!(app.query, "");
         assert!(app.result_refine.is_some());
 
-        app.handle_key(ctrl_key('r')).unwrap();
+        app.handle_key(ctrl_key('f')).unwrap();
 
         assert_eq!(app.query, "awk");
         assert!(app.result_refine.is_none());
@@ -1638,7 +2437,7 @@ mod tests {
     }
 
     #[test]
-    fn result_refine_fuzzy_filters_current_results() {
+    fn result_filter_fuzzy_filters_current_results() {
         let mut app = test_app();
         app.query = "awk".to_string();
         app.query_cursor = app.query.len();
@@ -1647,7 +2446,7 @@ mod tests {
             search_result_with_title("/tmp/archive.md", 1, "Archive Logs"),
         ];
 
-        app.handle_key(ctrl_key('r')).unwrap();
+        app.handle_key(ctrl_key('f')).unwrap();
         for ch in ['p', 's', 'f'] {
             app.handle_key(key(KeyCode::Char(ch))).unwrap();
         }

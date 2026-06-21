@@ -13,9 +13,9 @@ file is TOML at `${XDG_CONFIG_HOME:-~/.config}/neith/config.toml`.
 
 - Fast indexed search over Markdown libraries.
 - Fuzzy and exact query modes.
-- Result filters for names, content, and man pages.
+- Result types for names, content, and man pages.
 - Live man-page lookup with rendered man-page caching.
-- TUI preview pane with line selection and clipboard copy.
+- TUI preview pane with syntax highlighting, line selection, and clipboard copy.
 - Editor integration for opening results and creating new entries.
 - `status`, `healthcheck`, and JSON query commands for automation.
 - Bash and zsh completion generation.
@@ -29,8 +29,10 @@ Build dependencies:
 Runtime dependencies:
 
 - An editor command, from `editor.command`, `$EDITOR`, or `vi`.
-- `xsel` or `tmux` for preview copy support.
+- `wl-copy`, `xclip`, `xsel`, `tmux`, or `clipboard.command` for clipboard copy support.
 - `man` and `col` for live man-page results.
+- Optional: `bat` or `batcat` for syntax-highlighted previews.
+- `tmux` for popup use and `Ctrl-O` pane opens.
 
 The `install` and `uninstall` scripts use `sudo` for system paths under
 `/usr/local/bin`, `/usr/share/bash-completion`, and
@@ -87,15 +89,31 @@ pinned = true
 command = "nvim"
 return_behavior = "resume"
 
+[clipboard]
+command = "xclip -sel clip"
+
 [ui]
 preview_cursor_percent = 50
+preview_syntax = "auto"
+preview_bat_args = []
+
+[ui.prompt]
+separator = ":"
+right_separator = ">"
 ```
 
 Library paths are loaded from config first, then `NEITH_LIBS`, then `--libs`.
 `~/` is expanded at the start of a path. Shell variables such as `$HOME` are not
 expanded inside config strings. `preview_cursor_percent` controls where the
 preview cursor sits in the visible preview pane while scrolling; `50` keeps it
-near the middle.
+near the middle. `preview_syntax` accepts `auto`, `plain`, or `bat`; `auto` uses
+`bat` or `batcat` when found and falls back to plain preview. `preview_bat_args`
+adds extra argv entries after Neith's safe `bat` defaults and before the file
+path. Set `clipboard.command` to override clipboard copy; Neith writes copied
+text to the command's stdin.
+
+See `config-sample.toml` for all supported config fields, including prompt
+colors.
 
 Generate a config from currently resolved libraries:
 
@@ -169,11 +187,13 @@ neith json query awk print 3rd column --limit 10
 | --- | --- |
 | `Tab` | Switch results and preview focus. |
 | `Ctrl-A` | Add a new library entry from the current query. |
-| `Ctrl-K` | Toggle exact/fuzzy query mode. |
-| `Ctrl-R` | Toggle fuzzy refine over the current result list. |
-| `Ctrl-T` | Cycle result filters: `all`, `names`, `content`, `man`. |
+| `Ctrl-X` | Toggle exact/fuzzy query mode. |
+| `Ctrl-F` | Filter over the current result list. |
+| `Ctrl-T` | Cycle result types: `all`, `names`, `content`, `man`. |
 | `Ctrl-L` | Cycle pinned libraries or open the library selector. |
 | `Ctrl-H` | Open or close help. |
+| `Ctrl-C` | Quick-copy the selected note payload. |
+| `Ctrl-O` | Open the selected result in a new tmux pane and exit Neith. |
 | `Enter` in results | Open the selected result in the editor. |
 | `Enter` in add prompt | Create/open the edited note path. |
 | `Enter` or `Space` in preview | Start or finish copy selection. |
@@ -185,6 +205,20 @@ neith json query awk print 3rd column --limit 10
 | Mouse wheel over preview | Scroll preview text without changing focus or selection. |
 | `Ctrl-Q` | Quit from any mode. |
 | `Esc` | Cancel popup/copy/focus, or quit from results. |
+
+Quick-copy uses marked Markdown regions when present:
+
+````md
+<!-- copy_begin -->
+```bash
+fd -e md
+```
+<!-- copy_end -->
+````
+
+If a note has no copy region, `Ctrl-C` copies the only fenced code block. If
+there are multiple code blocks, Neith opens a chooser with `1-9` shortcuts,
+arrow navigation, and `Enter` to copy.
 
 ## Shell Completions
 
@@ -206,6 +240,10 @@ bind-key -r N run-shell "/path/to/neith/tmux_popup"
 
 Popup sizing can be adjusted with `NEITH_POPUP_WIDTH` and
 `NEITH_POPUP_HEIGHT`.
+
+From the popup, `Ctrl-O` opens the selected result in a new tmux split, closes
+Neith, and leaves a shell in that pane after the editor exits. Neith uses a
+vertical split for wide panes and a horizontal split otherwise.
 
 ## Development
 
