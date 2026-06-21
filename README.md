@@ -1,5 +1,8 @@
 # Neith
 
+## WORK IN PROGRESS
+This is a Rust rewrite of Neith (see legacy branch)
+
 ![Neith search UI](docs/images/example-main.png)
 
 Neith is a terminal search tool for Markdown knowledge libraries. In Egyptian
