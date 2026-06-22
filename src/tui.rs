@@ -216,6 +216,8 @@ impl App {
             return;
         };
         if self.preview.path.as_ref() == Some(&result.path) {
+            self.preview.cursor = result_line_to_cursor(result.line, self.preview.lines.len());
+            self.reposition_preview_scroll();
             return;
         }
         let text = fs::read_to_string(&result.path).unwrap_or_default();
@@ -230,7 +232,7 @@ impl App {
                     Vec::new()
                 }
             };
-        let cursor = result.line.saturating_sub(1);
+        let cursor = result_line_to_cursor(result.line, lines.len());
         let viewport_height = self.preview.viewport_height;
         self.preview = PreviewState {
             path: Some(result.path.clone()),
@@ -331,8 +333,13 @@ impl App {
     fn reposition_preview_scroll(&mut self) {
         if self.preview.lines.is_empty() {
             self.preview.scroll = 0;
+            self.preview.cursor = 0;
+            self.preview.anchor = None;
             return;
         }
+        let last_line = self.preview.lines.len() - 1;
+        self.preview.cursor = self.preview.cursor.min(last_line);
+        self.preview.anchor = self.preview.anchor.map(|anchor| anchor.min(last_line));
         let height = self.preview.viewport_height.max(1);
         let max_scroll = self.preview.lines.len().saturating_sub(height);
         let target_offset =
@@ -357,7 +364,10 @@ impl App {
     }
 
     fn mouse_can_scroll_preview(&self) -> bool {
-        !matches!(self.focus, Focus::LibrarySelector | Focus::Help)
+        !matches!(
+            self.focus,
+            Focus::LibrarySelector | Focus::QuickCopy | Focus::Help
+        )
     }
 
     fn mouse_is_over_preview(&self, column: u16, row: u16) -> bool {
@@ -427,15 +437,19 @@ impl App {
         if self.preview.lines.is_empty() {
             return;
         }
+        let last_line = self.preview.lines.len() - 1;
+        self.preview.cursor = self.preview.cursor.min(last_line);
         let start = self
             .preview
             .anchor
             .unwrap_or(self.preview.cursor)
+            .min(last_line)
             .min(self.preview.cursor);
         let end = self
             .preview
             .anchor
             .unwrap_or(self.preview.cursor)
+            .min(last_line)
             .max(self.preview.cursor);
         let text = self.preview.lines[start..=end].join("\n");
         match copy_text(&text, &self.config.app.clipboard.command) {
@@ -1129,6 +1143,7 @@ fn refresh_after_editor(app: &mut App) -> Result<()> {
     ensure_indexes(&app.config.libraries, false, |_library, _stage| {})?;
     let manager = IndexManager::open(&app.config.libraries)?;
     app.engine = SearchEngine::new(manager);
+    app.preview.path = None;
     app.refresh_after_search_context_change();
     Ok(())
 }
@@ -1481,6 +1496,14 @@ fn preview_cursor_offset(height: usize, percent: u8) -> usize {
         return 0;
     }
     (height * usize::from(percent.min(100)) / 100).min(height.saturating_sub(1))
+}
+
+fn result_line_to_cursor(line: usize, line_count: usize) -> usize {
+    if line_count == 0 {
+        0
+    } else {
+        line.saturating_sub(1).min(line_count - 1)
+    }
 }
 
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {

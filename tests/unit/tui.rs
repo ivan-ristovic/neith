@@ -29,6 +29,7 @@ fn test_app_with_libraries(libraries: Vec<Library>) -> App {
             ui: UiConfig::default(),
         },
         libraries,
+        dropped_libraries: Vec::new(),
     };
     let engine = SearchEngine::new(IndexManager {
         handles: Vec::new(),
@@ -554,6 +555,46 @@ fn preview_cursor_percent_clamps_to_viewport() {
 }
 
 #[test]
+fn selected_preview_cursor_clamps_to_loaded_file_lines() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("note.md");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let mut app = test_app();
+    app.results = vec![search_result(path.to_str().unwrap(), 99)];
+
+    app.load_selected_preview();
+
+    assert_eq!(app.preview.cursor, 1);
+}
+
+#[test]
+fn same_path_preview_updates_cursor_from_new_result_line() {
+    let mut app = test_app();
+    app.preview.path = Some(PathBuf::from("/tmp/note.md"));
+    app.preview.lines = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+    app.preview.cursor = 0;
+    app.results = vec![search_result("/tmp/note.md", 3)];
+
+    app.load_selected_preview();
+
+    assert_eq!(app.preview.cursor, 2);
+}
+
+#[test]
+fn preview_copy_clamps_stale_cursor_and_anchor() {
+    let mut app = test_app();
+    app.config.app.clipboard.command = "cat".to_string();
+    app.preview.lines = vec!["one".to_string(), "two".to_string()];
+    app.preview.cursor = 99;
+    app.preview.anchor = Some(0);
+
+    app.copy_preview_selection();
+
+    assert_eq!(app.status, "copied lines 1-2");
+    assert_eq!(app.preview.cursor, 1);
+}
+
+#[test]
 fn mouse_scroll_over_preview_moves_scroll_without_focus_or_cursor_change() {
     let mut app = test_app();
     app.focus = Focus::Results;
@@ -588,6 +629,10 @@ fn mouse_scroll_ignores_events_outside_preview_or_behind_modal() {
     assert_eq!(app.preview.scroll, 20);
 
     app.focus = Focus::Help;
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
+    assert_eq!(app.preview.scroll, 20);
+
+    app.focus = Focus::QuickCopy;
     app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
     assert_eq!(app.preview.scroll, 20);
 }

@@ -112,7 +112,7 @@ fn status_row(status: LibraryStatus) -> StatusRow {
 
 pub fn healthcheck(config_path: Option<PathBuf>, libs_arg: Option<&str>) -> HealthReport {
     let mut checks = Vec::new();
-    match RuntimeConfig::load(config_path, libs_arg) {
+    match RuntimeConfig::load_for_diagnostics(config_path, libs_arg) {
         Ok(runtime) => {
             checks.push(ok(
                 "config",
@@ -122,11 +122,20 @@ pub fn healthcheck(config_path: Option<PathBuf>, libs_arg: Option<&str>) -> Heal
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "using defaults/env".to_string()),
             ));
-            checks.push(ok(
-                "libraries",
-                format!("{} configured", runtime.libraries.len()),
+            let available = runtime.libraries.len();
+            let missing = runtime.dropped_libraries.len();
+            checks.push(match (available, missing) {
+                (0, 0) => failure("libraries", "0 configured"),
+                (_, 0) => ok("libraries", format!("{available} configured")),
+                _ => warning(
+                    "libraries",
+                    format!("{available} available, {missing} missing"),
+                ),
+            });
+            checks.extend(library_checks(
+                &runtime.libraries,
+                &runtime.dropped_libraries,
             ));
-            checks.extend(library_checks(&runtime.libraries));
             checks.extend(cache_index_checks(&runtime.libraries));
             checks.extend(tool_checks(&runtime));
         }
@@ -137,7 +146,7 @@ pub fn healthcheck(config_path: Option<PathBuf>, libs_arg: Option<&str>) -> Heal
     HealthReport { checks }
 }
 
-fn library_checks(libraries: &[Library]) -> Vec<Check> {
+fn library_checks(libraries: &[Library], dropped_libraries: &[Library]) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut aliases = HashMap::<&str, usize>::new();
     for library in libraries {
@@ -152,6 +161,13 @@ fn library_checks(libraries: &[Library]) -> Vec<Check> {
                 format!("{}: {err}", library.path.display()),
             )),
         }
+    }
+    for library in dropped_libraries {
+        *aliases.entry(&library.alias).or_default() += 1;
+        checks.push(failure(
+            format!("library {}", library.alias),
+            format!("{}: missing or not a directory", library.path.display()),
+        ));
     }
     for (alias, count) in aliases {
         if count > 1 {

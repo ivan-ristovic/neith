@@ -81,7 +81,7 @@ impl IndexManager {
     pub fn open(libraries: &[Library]) -> Result<Self> {
         let mut handles = Vec::new();
         for library in libraries {
-            let (index, fields) = open_index(library)?;
+            let (index, fields, _) = open_index(library)?;
             let reader = index
                 .reader_builder()
                 .reload_policy(ReloadPolicy::OnCommitWithDelay)
@@ -108,7 +108,9 @@ impl IndexManager {
 
     pub fn has_usable_indexes(libraries: &[Library]) -> bool {
         libraries.iter().all(|library| {
-            index_dir(library).join("meta.json").is_file() && manifest_path(library).is_file()
+            index_dir(library).join("meta.json").is_file()
+                && manifest_path(library).is_file()
+                && catalog_path(library).is_file()
         })
     }
 }
@@ -138,16 +140,24 @@ where
     F: FnMut(&str),
 {
     fs::create_dir_all(library.cache_dir())?;
-    let (index, fields) = open_index(library)?;
+
+    let loaded_manifest = load_manifest(library).ok();
+    let can_trust_manifest =
+        loaded_manifest.is_some() && index_dir(library).join("meta.json").is_file();
+    if !can_trust_manifest {
+        let _ = fs::remove_dir_all(index_dir(library));
+    }
+
+    let (index, fields, created_index) = open_index(library)?;
     let mut writer: IndexWriter = index.writer(100_000_000)?;
 
     progress("reading entries");
     let entries = discover_markdown_entries(library)?;
-    let current: HashMap<String, EntryDoc> = entries
-        .into_iter()
-        .map(|entry| (entry.path.to_string_lossy().to_string(), entry))
-        .collect();
-    let previous = load_manifest(library).unwrap_or_default();
+    let previous = if can_trust_manifest && !created_index {
+        loaded_manifest.unwrap_or_default()
+    } else {
+        IndexManifest::default()
+    };
     let previous_by_path: HashMap<String, FileSignature> = previous
         .files
         .into_iter()
@@ -155,9 +165,12 @@ where
         .collect();
 
     let mut stats = IndexStats::default();
-    let current_paths: HashSet<&str> = current.keys().map(String::as_str).collect();
+    let current_paths = entries
+        .iter()
+        .map(|entry| entry.path.to_string_lossy().to_string())
+        .collect::<HashSet<_>>();
     for old_path in previous_by_path.keys() {
-        if !current_paths.contains(old_path.as_str()) {
+        if !current_paths.contains(old_path) {
             writer.delete_term(Term::from_field_text(fields.path_exact, old_path));
             stats.removed += 1;
         }
@@ -166,10 +179,11 @@ where
     progress("indexing changed files");
     let mut next_manifest = IndexManifest {
         version: INDEX_VERSION,
-        files: Vec::with_capacity(current.len()),
+        files: Vec::with_capacity(entries.len()),
     };
 
-    for (path, entry) in current {
+    for entry in entries {
+        let path = entry.path.to_string_lossy().to_string();
         let signature = FileSignature {
             path: path.clone(),
             rel_path: entry.rel_path.clone(),
@@ -216,19 +230,22 @@ fn entry_to_tantivy_doc(fields: &SearchFields, entry: &EntryDoc) -> TantivyDocum
     )
 }
 
-fn open_index(library: &Library) -> Result<(Index, SearchFields)> {
+fn open_index(library: &Library) -> Result<(Index, SearchFields, bool)> {
     fs::create_dir_all(index_dir(library))?;
     let schema = build_schema();
-    let index = match Index::open_in_dir(index_dir(library)) {
-        Ok(index) => index,
+    let (index, created) = match Index::open_in_dir(index_dir(library)) {
+        Ok(index) => (index, false),
         Err(_) => {
             let _ = fs::remove_dir_all(index_dir(library));
             fs::create_dir_all(index_dir(library))?;
-            Index::create_in_dir(index_dir(library), schema.clone())?
+            (
+                Index::create_in_dir(index_dir(library), schema.clone())?,
+                true,
+            )
         }
     };
     let fields = fields_from_schema(&index.schema())?;
-    Ok((index, fields))
+    Ok((index, fields, created))
 }
 
 fn build_schema() -> Schema {
@@ -367,7 +384,11 @@ fn load_manifest(library: &Library) -> Result<IndexManifest> {
     if manifest.version == INDEX_VERSION {
         Ok(manifest)
     } else {
-        Ok(IndexManifest::default())
+        anyhow::bail!(
+            "unsupported index manifest version {} for {}",
+            manifest.version,
+            library.alias
+        )
     }
 }
 
@@ -409,3 +430,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     fs::rename(tmp, path)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/indexer.rs"]
+mod tests;

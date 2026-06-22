@@ -42,7 +42,7 @@ fn reports_current_index_status() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("note.md"), "# Test\n").unwrap();
     let library = Library::new(temp.path().to_path_buf(), Some("test".to_string()), None);
-    ensure_indexes(&[library.clone()], false, |_library, _stage| {}).unwrap();
+    ensure_indexes(std::slice::from_ref(&library), false, |_library, _stage| {}).unwrap();
 
     let rows = collect_status_rows(&[library]).unwrap();
 
@@ -77,6 +77,7 @@ fn tool_checks_report_missing_custom_clipboard_command() {
         path: None,
         app: AppConfig::default(),
         libraries: Vec::new(),
+        dropped_libraries: Vec::new(),
     };
     runtime.app.editor.command = "true".to_string();
     runtime.app.clipboard.command = "definitely-missing-neith-copy --flag".to_string();
@@ -92,4 +93,30 @@ fn tool_checks_report_missing_custom_clipboard_command() {
         clipboard.detail,
         "custom command not found in PATH: definitely-missing-neith-copy"
     );
+}
+
+#[test]
+fn healthcheck_reports_missing_configured_libraries() {
+    let temp = tempfile::tempdir().unwrap();
+    let valid = temp.path().join("valid");
+    std::fs::create_dir(&valid).unwrap();
+    let missing = temp.path().join("missing");
+    let config = temp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[editor]\ncommand = \"true\"\n\n[[libraries]]\npath = \"{}\"\nalias = \"valid\"\n\n[[libraries]]\npath = \"{}\"\nalias = \"missing\"\n",
+            valid.display(),
+            missing.display()
+        ),
+    )
+    .unwrap();
+
+    let report = healthcheck(Some(config), None);
+
+    assert!(report.checks.iter().any(|check| {
+        check.level == CheckLevel::Failure
+            && check.name == "library missing"
+            && check.detail.contains("missing or not a directory")
+    }));
 }

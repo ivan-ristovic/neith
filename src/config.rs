@@ -166,10 +166,26 @@ pub struct RuntimeConfig {
     pub path: Option<PathBuf>,
     pub app: AppConfig,
     pub libraries: Vec<Library>,
+    pub dropped_libraries: Vec<Library>,
 }
 
 impl RuntimeConfig {
     pub fn load(config_path: Option<PathBuf>, libs_arg: Option<&str>) -> Result<Self> {
+        Self::load_inner(config_path, libs_arg, true)
+    }
+
+    pub fn load_for_diagnostics(
+        config_path: Option<PathBuf>,
+        libs_arg: Option<&str>,
+    ) -> Result<Self> {
+        Self::load_inner(config_path, libs_arg, false)
+    }
+
+    fn load_inner(
+        config_path: Option<PathBuf>,
+        libs_arg: Option<&str>,
+        require_libraries: bool,
+    ) -> Result<Self> {
         let path = config_path.or_else(default_config_path);
         let mut app = if let Some(path) = &path {
             if path.is_file() {
@@ -207,9 +223,18 @@ impl RuntimeConfig {
         }
 
         dedupe_libraries(&mut libraries);
-        libraries.retain(|library| library.path.is_dir());
+        let mut dropped_libraries = Vec::new();
+        let mut available_libraries = Vec::new();
+        for library in libraries {
+            if library.path.is_dir() {
+                available_libraries.push(library);
+            } else {
+                dropped_libraries.push(library);
+            }
+        }
+        let libraries = available_libraries;
 
-        if libraries.is_empty() {
+        if require_libraries && libraries.is_empty() {
             bail!("no libraries configured; run `neith config init` or pass `--libs`");
         }
 
@@ -217,6 +242,7 @@ impl RuntimeConfig {
             path,
             app,
             libraries,
+            dropped_libraries,
         })
     }
 
