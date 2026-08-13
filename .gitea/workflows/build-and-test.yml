@@ -1,0 +1,31 @@
+name: Run tests
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        uses: ./.gitea/actions/setup
+
+      - name: Build
+        run: ./build
+
+      - name: Release
+        run: ./release
+
+      - name: Run tests
+        run: ./test
+
+      - name: Check for failures
+        uses: ./.gitea/actions/failure-notification
+
