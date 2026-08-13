@@ -27,5 +27,12 @@ jobs:
         run: ./test
 
       - name: Check for failures
-        uses: ./.gitea/actions/failure-notification
+        if: ${{ failure() }}
+        uses: https://github.com/ivan-ristovic/action-gitea-workflow-error-email@v1
+        with:
+          smtp-host: ${{ secrets.SMTP_HOST }}
+          smtp-username: ${{ secrets.SMTP_USERNAME }}
+          smtp-password: ${{ secrets.SMTP_PASSWORD }}
+          from: ${{ secrets.SMTP_FROM }}
+          to: ${{ secrets.WORKFLOW_ERROR_EMAIL }}
 
