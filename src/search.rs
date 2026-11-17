@@ -1,10 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as FuzzyConfig, Matcher, Utf32Str};
+use regex_syntax::hir::literal::Extractor;
 use serde::Serialize;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -12,7 +14,7 @@ use tantivy::schema::Value;
 use tantivy::{DocAddress, TantivyDocument};
 
 use crate::indexer::{CatalogEntry, IndexHandle, IndexManager, SearchFields};
-use crate::library::SourceKind;
+use crate::library::{SearchBloom, SourceKind};
 use crate::man;
 use crate::query::{
     LibraryScope, MatchMode, SearchRequest, SourceFilter, has_regex_meta, normalize_query,
@@ -53,6 +55,7 @@ impl SearchResult {
 pub struct SearchEngine {
     pub manager: IndexManager,
     pub man_cache_dir: PathBuf,
+    man_lookup_cache: Arc<Mutex<man::ManLookupCache>>,
 }
 
 impl SearchEngine {
@@ -64,6 +67,7 @@ impl SearchEngine {
         Self {
             manager,
             man_cache_dir,
+            man_lookup_cache: Arc::new(Mutex::new(man::ManLookupCache::default())),
         }
     }
 
@@ -72,6 +76,17 @@ impl SearchEngine {
     }
 
     pub fn search(&self, request: &SearchRequest) -> Vec<SearchResult> {
+        self.search_with_cancel(request, &|| false)
+    }
+
+    pub fn search_with_cancel(
+        &self,
+        request: &SearchRequest,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Vec<SearchResult> {
+        if should_cancel() || request.limit == 0 {
+            return Vec::new();
+        }
         let is_regex = request.mode == MatchMode::Exact && has_regex_meta(&request.query);
         let query = if is_regex {
             request.query.trim().to_string()
@@ -86,7 +101,15 @@ impl SearchEngine {
         if matches!(&request.library, LibraryScope::All)
             && matches!(request.filter, SourceFilter::All | SourceFilter::Man)
         {
-            results.extend(man::lookup_live_man(&query, &self.man_cache_dir));
+            let mut cache = self
+                .man_lookup_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            results.extend(man::lookup_live_man_cached(
+                &query,
+                &self.man_cache_dir,
+                &mut cache,
+            ));
         }
         if matches!(
             request.filter,
@@ -96,12 +119,15 @@ impl SearchEngine {
         }
 
         if is_regex {
-            results.extend(self.search_regex(request, &query));
+            results.extend(self.search_regex(request, &query, should_cancel));
         } else {
-            results.extend(self.search_tantivy(request, &query));
+            results.extend(self.search_tantivy(request, &query, should_cancel));
             if request.mode == MatchMode::Fuzzy && results.is_empty() {
-                results.extend(self.search_catalog_fuzzy(request, &query));
+                results.extend(self.search_catalog_fuzzy(request, &query, should_cancel));
             }
+        }
+        if should_cancel() {
+            return Vec::new();
         }
 
         let mut by_path: HashMap<String, SearchResult> = HashMap::new();
@@ -141,17 +167,36 @@ impl SearchEngine {
         results
     }
 
-    fn search_regex(&self, request: &SearchRequest, query: &str) -> Vec<SearchResult> {
+    fn search_regex(
+        &self,
+        request: &SearchRequest,
+        query: &str,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Vec<SearchResult> {
         let Ok(regex) = regex::RegexBuilder::new(query)
             .case_insensitive(true)
             .build()
         else {
             return Vec::new();
         };
-        let mut results = Vec::new();
+        let prefilter = RegexPrefilter::new(query);
+        let mut results = BinaryHeap::new();
+        let capacity = request.limit.saturating_mul(2);
+        if capacity == 0 {
+            return Vec::new();
+        }
         for handle in self.matching_handles(&request.library) {
             for item in &handle.catalog {
+                if should_cancel() {
+                    return Vec::new();
+                }
                 if !source_matches(request.filter, &item.source_kind) {
+                    continue;
+                }
+                if prefilter
+                    .as_ref()
+                    .is_some_and(|prefilter| !prefilter.might_match(item.search_bloom))
+                {
                     continue;
                 }
                 let mut result = result_from_catalog(item, 0.0, "regex");
@@ -166,14 +211,20 @@ impl SearchEngine {
                     result.line = line;
                     result.snippet = snippet;
                     apply_boosts(&mut result, query, request.filter, "regex");
-                    results.push(result);
+                    result.body.clear();
+                    retain_top_result(&mut results, result, capacity);
                 }
             }
         }
-        results
+        results.into_iter().map(|ranked| ranked.result).collect()
     }
 
-    fn search_tantivy(&self, request: &SearchRequest, query: &str) -> Vec<SearchResult> {
+    fn search_tantivy(
+        &self,
+        request: &SearchRequest,
+        query: &str,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Vec<SearchResult> {
         let mut results = Vec::new();
         let query_texts = query_variants_for_index(request.mode, query);
         if query_texts.is_empty() {
@@ -183,6 +234,9 @@ impl SearchEngine {
             let fields = fields_for_filter(&handle.fields, request.filter);
             let searcher = handle.reader.searcher();
             for query_text in &query_texts {
+                if should_cancel() {
+                    return Vec::new();
+                }
                 let mut parser = QueryParser::for_index(&handle.index, fields.clone());
                 parser.set_conjunction_by_default();
                 let Ok(parsed) = parser.parse_query(query_text) else {
@@ -238,7 +292,12 @@ impl SearchEngine {
         results
     }
 
-    fn search_catalog_fuzzy(&self, request: &SearchRequest, query: &str) -> Vec<SearchResult> {
+    fn search_catalog_fuzzy(
+        &self,
+        request: &SearchRequest,
+        query: &str,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Vec<SearchResult> {
         let mut matcher = Matcher::new(FuzzyConfig::DEFAULT.match_paths());
         let pattern = Pattern::new(
             query,
@@ -254,6 +313,9 @@ impl SearchEngine {
 
         for handle in self.matching_handles(&request.library) {
             for item in &handle.catalog {
+                if should_cancel() {
+                    return Vec::new();
+                }
                 if !source_matches(request.filter, &item.source_kind) {
                     continue;
                 }
@@ -270,6 +332,9 @@ impl SearchEngine {
             seen.clear();
             for handle in self.matching_handles(&request.library) {
                 for item in &handle.catalog {
+                    if should_cancel() {
+                        return Vec::new();
+                    }
                     if !source_matches(request.filter, &item.source_kind) {
                         continue;
                     }
@@ -281,6 +346,9 @@ impl SearchEngine {
         }
 
         for item in candidates {
+            if should_cancel() {
+                return Vec::new();
+            }
             let combined = format!("{} {} {}", item.title, item.rel_path, item.excerpt);
             let Some(score) = pattern.score(Utf32Str::new(&combined, &mut buf), &mut matcher)
             else {
@@ -345,6 +413,95 @@ impl SearchEngine {
             body,
             is_live_man: false,
         })
+    }
+}
+
+struct RegexPrefilter {
+    prefixes: Vec<Vec<u8>>,
+}
+
+impl RegexPrefilter {
+    fn new(pattern: &str) -> Option<Self> {
+        let hir = regex_syntax::parse(pattern).ok()?;
+        let sequence = Extractor::new().extract(&hir);
+        let literals = sequence.literals()?;
+        if literals.is_empty()
+            || literals
+                .iter()
+                .any(|literal| literal.len() < 3 || !literal.as_bytes().is_ascii())
+        {
+            return None;
+        }
+        Some(Self {
+            prefixes: literals
+                .iter()
+                .map(|literal| literal.as_bytes().to_vec())
+                .collect(),
+        })
+    }
+
+    fn might_match(&self, bloom: Option<SearchBloom>) -> bool {
+        bloom.is_none_or(|bloom| {
+            self.prefixes
+                .iter()
+                .any(|literal| bloom.might_contain(literal))
+        })
+    }
+}
+
+struct RankedResult {
+    result: SearchResult,
+    display_line: String,
+}
+
+impl RankedResult {
+    fn new(result: SearchResult) -> Self {
+        let display_line = result.display_line();
+        Self {
+            result,
+            display_line,
+        }
+    }
+}
+
+impl PartialEq for RankedResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for RankedResult {}
+
+impl PartialOrd for RankedResult {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedResult {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .result
+            .score
+            .partial_cmp(&self.result.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.display_line.cmp(&other.display_line))
+    }
+}
+
+fn retain_top_result(
+    results: &mut BinaryHeap<RankedResult>,
+    candidate: SearchResult,
+    capacity: usize,
+) {
+    let candidate = RankedResult::new(candidate);
+    if results.len() < capacity {
+        results.push(candidate);
+        return;
+    }
+    if results.peek().is_some_and(|worst| candidate < *worst) {
+        results.pop();
+        results.push(candidate);
     }
 }
 

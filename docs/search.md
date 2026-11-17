@@ -15,9 +15,11 @@ Neith normalizes ordinal query terms. For example, `3rd`, `nth`, and `$3` are
 normalized to `selected`, which helps queries such as `awk print 3rd column`
 match notes written with more generic wording.
 
-Regex queries use their original text. On large libraries, they can take longer
-than indexed searches because Neith checks each matching entry. Sectioned man
-queries such as `printf(3)` also use man-page lookup.
+Regex queries use their original text. Neith skips entries that cannot contain
+a required literal when the pattern has a safe literal prefix and the entry is
+ASCII. Other regex patterns still scan the selected entries and can take longer
+than indexed searches. TUI searches run in the background, so typing remains
+responsive. Sectioned man queries such as `printf(3)` also use man-page lookup.
 
 ## Result Filters
 
@@ -49,6 +51,7 @@ printf(3) format
 
 Neith calls `man -wa`, renders matching pages through `man -l` and `col -b`,
 and caches the rendered text under `${XDG_CACHE_HOME:-~/.cache}/neith/man/`.
+Repeated lookups of the same page within a session reuse the resolved result.
 
 ## Result Display
 

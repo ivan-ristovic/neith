@@ -41,6 +41,7 @@ External crates:
 - `tantivy`: indexed search and result loading.
 - `nucleo-matcher`: fuzzy catalog fallback.
 - `regex`: exact-mode verification.
+- `regex-syntax`: safe literal extraction for regex prefiltering.
 - `dirs`: live man cache directory resolution.
 - `serde`: JSON result serialization.
 
@@ -73,8 +74,11 @@ This is intentionally small and query-domain-specific.
 Exact mode uses Tantivy query parsing for plain queries. If the query contains
 regex metacharacters, Neith builds a case-insensitive regex and checks catalog
 entries directly. It reads note bodies when the result filter permits content
-matches. This avoids losing regex matches through an incomplete index seed, but
-scans all entries in the selected scope.
+matches. For patterns whose every branch has a required ASCII literal prefix
+of at least three bytes, the catalog trigram filter can skip ASCII entries
+without opening their files. Patterns without such prefixes, entries with
+non-ASCII content, and old catalog entries without filters still receive the
+full scan. The candidate list is bounded to twice the requested result limit.
 
 ## Live Man Lookup
 
@@ -86,6 +90,10 @@ scans all entries in the selected scope.
 4. Renders pages with `man -l` piped to `col -b`.
 5. Writes rendered text under the man cache directory.
 6. Returns synthetic `SearchResult` values with library alias `live-man`.
+
+The search engine keeps a small session cache of resolved man pages, including
+unsuccessful lookups. The TUI worker can cancel obsolete searches between
+entries, but a man subprocess already running completes before cancellation.
 
 ## Invariants
 

@@ -38,7 +38,7 @@ Each library cache has this shape:
 
 `tantivy/` stores the full-text index. `manifest.json` stores file signatures
 for incremental updates. `catalog.json` stores lightweight metadata used for
-empty-query results, man-page matching, and fuzzy fallback.
+empty-query results, man-page matching, fuzzy fallback, and regex filtering.
 
 Live man-page rendering uses a user cache:
 
@@ -52,10 +52,10 @@ During `neith index`, Neith:
 
 1. Discovers current Markdown entries.
 2. Loads the previous manifest.
-3. Deletes entries whose paths disappeared.
-4. Reindexes entries whose signatures changed.
-5. Leaves unchanged entries in place.
-6. Writes a new manifest and catalog.
+3. Compares current entries with saved signatures.
+4. Opens the index writer only when documents were added, changed, or removed.
+5. Writes the manifest and catalog when their contents changed. An unchanged
+   index run leaves both files in place.
 
 A file is unchanged only when every signature field matches:
 
@@ -67,6 +67,10 @@ A file is unchanged only when every signature field matches:
 - size
 - modified time
 - content hash
+
+The catalog also stores an optional search filter for each entry. Existing
+caches are upgraded during the next index run without rebuilding their Tantivy
+documents.
 
 ## Startup Behavior
 

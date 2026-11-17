@@ -1,11 +1,15 @@
+use std::collections::VecDeque;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use ansi_to_tui::IntoText as _;
 use anyhow::Result;
@@ -31,12 +35,97 @@ use crate::quick_copy::{self, CodeBlock, ExtractedCopy};
 use crate::search::{SearchEngine, SearchResult};
 
 const MOUSE_SCROLL_LINES: isize = 3;
+const PREVIEW_CACHE_CAPACITY: usize = 16;
+const PREVIEW_CACHE_MAX_FILE_BYTES: u64 = 128 * 1024;
 const BAT_PREVIEW_ARGS: &[&str] = &[
     "--color=always",
     "--paging=never",
     "--style=plain",
     "--wrap=never",
 ];
+
+pub enum RefreshEvent {
+    Progress { alias: String, stage: String },
+    Finished(Result<()>),
+}
+
+#[derive(Clone, Copy)]
+enum SearchKind {
+    Results,
+    RefineBase,
+}
+
+struct SearchJob {
+    generation: u64,
+    kind: SearchKind,
+    request: SearchRequest,
+    engine: Arc<SearchEngine>,
+}
+
+struct SearchDone {
+    generation: u64,
+    kind: SearchKind,
+    results: Vec<SearchResult>,
+}
+
+struct SearchWorker {
+    sender: Sender<SearchJob>,
+    receiver: Receiver<SearchDone>,
+    generation: Arc<AtomicU64>,
+}
+
+impl SearchWorker {
+    fn new() -> Self {
+        let (sender, jobs) = mpsc::channel::<SearchJob>();
+        let (completed, receiver) = mpsc::channel();
+        let generation = Arc::new(AtomicU64::new(0));
+        let current = Arc::clone(&generation);
+        thread::spawn(move || {
+            while let Ok(mut job) = jobs.recv() {
+                while let Ok(newer) = jobs.recv_timeout(Duration::from_millis(60)) {
+                    job = newer;
+                }
+                let results = job.engine.search_with_cancel(&job.request, &|| {
+                    current.load(Ordering::Relaxed) != job.generation
+                });
+                if current.load(Ordering::Relaxed) == job.generation
+                    && completed
+                        .send(SearchDone {
+                            generation: job.generation,
+                            kind: job.kind,
+                            results,
+                        })
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            sender,
+            receiver,
+            generation,
+        }
+    }
+
+    fn submit(&self, request: SearchRequest, engine: Arc<SearchEngine>, kind: SearchKind) -> bool {
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.sender
+            .send(SearchJob {
+                generation,
+                kind,
+                request,
+                engine,
+            })
+            .is_ok()
+    }
+}
+
+impl Drop for SearchWorker {
+    fn drop(&mut self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Focus {
@@ -51,6 +140,7 @@ enum Focus {
 #[derive(Default)]
 struct PreviewState {
     path: Option<PathBuf>,
+    stamp: Option<(u64, SystemTime)>,
     lines: Vec<String>,
     syntax_lines: Vec<Line<'static>>,
     scroll: usize,
@@ -58,6 +148,14 @@ struct PreviewState {
     viewport_height: usize,
     copy_mode: bool,
     anchor: Option<usize>,
+}
+
+#[derive(Clone)]
+struct PreviewCacheEntry {
+    path: PathBuf,
+    stamp: (u64, SystemTime),
+    lines: Vec<String>,
+    syntax_lines: Vec<Line<'static>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,7 +187,10 @@ struct QuickCopyState {
 
 pub struct App {
     config: RuntimeConfig,
-    engine: SearchEngine,
+    engine: Arc<SearchEngine>,
+    search_worker: Option<SearchWorker>,
+    search_pending: bool,
+    search_started: Instant,
     query: String,
     query_cursor: usize,
     filter: SourceFilter,
@@ -99,8 +200,12 @@ pub struct App {
     results: Vec<SearchResult>,
     selected: usize,
     preview: PreviewState,
+    preview_cache: VecDeque<PreviewCacheEntry>,
     preview_area: Option<Rect>,
     status: String,
+    refresh_stage: Option<String>,
+    refresh_started: Instant,
+    refresh_finished: Option<Instant>,
     library_scopes: Vec<LibraryScope>,
     library_index: usize,
     library_selector_index: usize,
@@ -114,6 +219,15 @@ pub struct App {
 
 impl App {
     pub fn new(config: RuntimeConfig, engine: SearchEngine, initial_query: String) -> Self {
+        Self::new_inner(config, engine, initial_query, false)
+    }
+
+    fn new_inner(
+        config: RuntimeConfig,
+        engine: SearchEngine,
+        initial_query: String,
+        defer_search: bool,
+    ) -> Self {
         let mut library_scopes = vec![LibraryScope::All];
         for library in &config.libraries {
             if library.pinned {
@@ -122,7 +236,10 @@ impl App {
         }
         let mut app = Self {
             config,
-            engine,
+            engine: Arc::new(engine),
+            search_worker: None,
+            search_pending: false,
+            search_started: Instant::now(),
             query_cursor: initial_query.len(),
             query: initial_query,
             filter: SourceFilter::All,
@@ -132,8 +249,12 @@ impl App {
             results: Vec::new(),
             selected: 0,
             preview: PreviewState::default(),
+            preview_cache: VecDeque::new(),
             preview_area: None,
             status: String::new(),
+            refresh_stage: None,
+            refresh_started: Instant::now(),
+            refresh_finished: None,
             library_scopes,
             library_index: 0,
             library_selector_index: 0,
@@ -144,7 +265,9 @@ impl App {
             tmux_pane_opener: open_editor_in_tmux_pane,
             should_quit: false,
         };
-        app.refresh_results();
+        if !defer_search {
+            app.refresh_results();
+        }
         app
     }
 
@@ -153,6 +276,34 @@ impl App {
             .get(self.library_index)
             .cloned()
             .unwrap_or(LibraryScope::All)
+    }
+
+    fn footer_text(&self) -> String {
+        let spinner = |started: Instant| {
+            let frames = ['|', '/', '-', '\\'];
+            frames[(started.elapsed().as_millis() / 120) as usize % frames.len()]
+        };
+        if self.search_pending {
+            let suffix = self
+                .refresh_stage
+                .as_ref()
+                .map(|stage| format!(" | Refreshing indexes: {stage}"))
+                .unwrap_or_default();
+            return format!(" {} Searching...{suffix}", spinner(self.search_started));
+        }
+        if let Some(stage) = &self.refresh_stage {
+            return format!(
+                " {} Refreshing indexes: {stage}",
+                spinner(self.refresh_started)
+            );
+        }
+        if self
+            .refresh_finished
+            .is_some_and(|finished| finished.elapsed() < Duration::from_secs(2))
+        {
+            return " Indexes ready".to_string();
+        }
+        format!(" {} results", self.results.len())
     }
 
     fn refresh_results(&mut self) {
@@ -172,6 +323,21 @@ impl App {
             library: self.current_library_scope(),
             limit: 80,
         };
+        if let Some(worker) = &self.search_worker {
+            if worker.submit(
+                request.clone(),
+                Arc::clone(&self.engine),
+                SearchKind::Results,
+            ) {
+                self.search_pending = true;
+                self.search_started = Instant::now();
+                self.results.clear();
+                self.selected = 0;
+                self.preview = PreviewState::default();
+                return;
+            }
+            self.search_worker = None;
+        }
         self.results = self.engine.search(&request);
         self.finish_result_refresh();
     }
@@ -188,6 +354,21 @@ impl App {
             library: self.current_library_scope(),
             limit: 80,
         };
+        if let Some(worker) = &self.search_worker {
+            if worker.submit(
+                request.clone(),
+                Arc::clone(&self.engine),
+                SearchKind::RefineBase,
+            ) {
+                self.search_pending = true;
+                self.search_started = Instant::now();
+                self.results.clear();
+                self.selected = 0;
+                self.preview = PreviewState::default();
+                return;
+            }
+            self.search_worker = None;
+        }
         let base_results = self.engine.search(&request);
         if let Some(state) = &mut self.result_refine {
             state.base_results = base_results;
@@ -195,8 +376,42 @@ impl App {
         self.refresh_refined_results();
     }
 
+    fn poll_search(&mut self) {
+        let Some(worker) = &self.search_worker else {
+            return;
+        };
+        let mut latest = None;
+        while let Ok(completed) = worker.receiver.try_recv() {
+            if completed.generation == worker.generation.load(Ordering::Relaxed) {
+                latest = Some(completed);
+            }
+        }
+        let Some(completed) = latest else {
+            return;
+        };
+        self.search_pending = false;
+        match completed.kind {
+            SearchKind::Results if self.result_refine.is_none() => {
+                self.results = completed.results;
+                self.finish_result_refresh();
+            }
+            SearchKind::RefineBase if self.result_refine.is_some() => {
+                if let Some(state) = &mut self.result_refine {
+                    state.base_results = completed.results;
+                }
+                self.refresh_refined_results();
+            }
+            _ => {}
+        }
+    }
+
     fn refresh_refined_results(&mut self) {
         self.clamp_query_cursor();
+        if self.search_pending {
+            self.results.clear();
+            self.preview = PreviewState::default();
+            return;
+        }
         let Some(state) = &self.result_refine else {
             return;
         };
@@ -216,27 +431,55 @@ impl App {
             self.preview = PreviewState::default();
             return;
         };
-        if self.preview.path.as_ref() == Some(&result.path) {
-            self.preview.cursor = result_line_to_cursor(result.line, self.preview.lines.len());
+        let path = result.path.clone();
+        let line = result.line;
+        let stamp = fs::metadata(&path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok().map(|time| (metadata.len(), time)));
+        if self.preview.path.as_ref() == Some(&path) && self.preview.stamp == stamp {
+            self.preview.cursor = result_line_to_cursor(line, self.preview.lines.len());
             self.reposition_preview_scroll();
             return;
         }
-        let text = fs::read_to_string(&result.path).unwrap_or_default();
-        let lines = text.lines().map(str::to_string).collect::<Vec<_>>();
-        let syntax_lines =
-            match load_syntax_preview_lines(&result.path, lines.len(), &self.config.app.ui) {
-                Ok(lines) => lines.unwrap_or_default(),
-                Err(err) => {
-                    if self.config.app.ui.preview_syntax == PreviewSyntax::Bat {
-                        self.status = format!("bat preview failed: {err}");
+        let cached = stamp.and_then(|stamp| {
+            let position = self
+                .preview_cache
+                .iter()
+                .position(|entry| entry.path == path && entry.stamp == stamp)?;
+            let entry = self.preview_cache.remove(position)?;
+            let content = (entry.lines.clone(), entry.syntax_lines.clone());
+            self.preview_cache.push_front(entry);
+            Some(content)
+        });
+        let (lines, syntax_lines) = cached.unwrap_or_else(|| {
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            let lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+            let syntax_lines =
+                match load_syntax_preview_lines(&path, lines.len(), &self.config.app.ui) {
+                    Ok(lines) => lines.unwrap_or_default(),
+                    Err(err) => {
+                        if self.config.app.ui.preview_syntax == PreviewSyntax::Bat {
+                            self.status = format!("bat preview failed: {err}");
+                        }
+                        Vec::new()
                     }
-                    Vec::new()
-                }
-            };
-        let cursor = result_line_to_cursor(result.line, lines.len());
+                };
+            if let Some(stamp) = stamp.filter(|(size, _)| *size <= PREVIEW_CACHE_MAX_FILE_BYTES) {
+                self.preview_cache.push_front(PreviewCacheEntry {
+                    path: path.clone(),
+                    stamp,
+                    lines: lines.clone(),
+                    syntax_lines: syntax_lines.clone(),
+                });
+                self.preview_cache.truncate(PREVIEW_CACHE_CAPACITY);
+            }
+            (lines, syntax_lines)
+        });
+        let cursor = result_line_to_cursor(line, lines.len());
         let viewport_height = self.preview.viewport_height;
         self.preview = PreviewState {
-            path: Some(result.path.clone()),
+            path: Some(path),
+            stamp,
             lines,
             syntax_lines,
             scroll: 0,
@@ -1057,7 +1300,7 @@ pub fn run_with_refresh(
     config: RuntimeConfig,
     engine: SearchEngine,
     initial_query: String,
-    refresh: Receiver<Result<()>>,
+    refresh: Receiver<RefreshEvent>,
 ) -> Result<()> {
     run_inner_with_refresh(config, engine, initial_query, Some(refresh))
 }
@@ -1066,14 +1309,17 @@ fn run_inner_with_refresh(
     config: RuntimeConfig,
     engine: SearchEngine,
     initial_query: String,
-    refresh: Option<Receiver<Result<()>>>,
+    refresh: Option<Receiver<RefreshEvent>>,
 ) -> Result<()> {
     let mut terminal = init_terminal()?;
-    let result = run_inner(
-        &mut terminal,
-        App::new(config, engine, initial_query),
-        refresh,
-    );
+    let mut app = App::new_inner(config, engine, initial_query, true);
+    app.search_worker = Some(SearchWorker::new());
+    app.refresh_results();
+    if refresh.is_some() {
+        app.refresh_stage = Some("starting".to_string());
+        app.refresh_started = Instant::now();
+    }
+    let result = run_inner(&mut terminal, app, refresh);
     restore_terminal();
     result
 }
@@ -1081,26 +1327,38 @@ fn run_inner_with_refresh(
 fn run_inner(
     terminal: &mut DefaultTerminal,
     mut app: App,
-    mut refresh: Option<Receiver<Result<()>>>,
+    mut refresh: Option<Receiver<RefreshEvent>>,
 ) -> Result<()> {
     loop {
+        app.poll_search();
         if let Some(receiver) = &refresh {
-            match receiver.try_recv() {
-                Ok(Ok(())) => {
-                    if let Err(err) = reload_search_engine(&mut app) {
-                        app.status = format!("index refresh failed: {err:#}");
+            let mut finished = false;
+            loop {
+                match receiver.try_recv() {
+                    Ok(RefreshEvent::Progress { alias, stage }) => {
+                        app.refresh_stage = Some(format!("{alias}: {stage}"));
                     }
-                    refresh = None;
+                    Ok(RefreshEvent::Finished(result)) => {
+                        app.refresh_stage = None;
+                        app.refresh_finished = Some(Instant::now());
+                        if let Err(err) = result.and_then(|()| reload_search_engine(&mut app)) {
+                            app.status = format!("index refresh failed: {err:#}");
+                            app.refresh_finished = None;
+                        }
+                        finished = true;
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        app.status = "index refresh stopped".to_string();
+                        app.refresh_stage = None;
+                        finished = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
                 }
-                Ok(Err(err)) => {
-                    app.status = format!("index refresh failed: {err:#}");
-                    refresh = None;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    app.status = "index refresh stopped".to_string();
-                    refresh = None;
-                }
-                Err(TryRecvError::Empty) => {}
+            }
+            if finished {
+                refresh = None;
             }
         }
         terminal.draw(|frame| draw(frame, &mut app))?;
@@ -1192,8 +1450,9 @@ fn refresh_after_editor(app: &mut App) -> Result<()> {
 
 fn reload_search_engine(app: &mut App) -> Result<()> {
     let manager = IndexManager::open(&app.config.libraries)?;
-    app.engine = SearchEngine::new(manager);
+    app.engine = Arc::new(SearchEngine::new(manager));
     app.preview.path = None;
+    app.preview_cache.clear();
     app.refresh_after_search_context_change();
     Ok(())
 }
@@ -1207,12 +1466,20 @@ fn editor_status_message(status: std::process::ExitStatus) -> String {
 
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
+        .split(outer[0]);
     draw_preview(frame, chunks[0], app);
     draw_results(frame, chunks[1], app);
+    frame.render_widget(
+        Paragraph::new(app.footer_text()).style(Style::default().fg(Color::DarkGray)),
+        outer[1],
+    );
     if app.focus == Focus::LibrarySelector {
         draw_library_selector(frame, centered_rect(70, 70, area), app);
     }

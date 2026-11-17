@@ -155,11 +155,17 @@ fn ensure_ready_indexes(runtime: &RuntimeConfig, rebuild: bool) -> Result<()> {
 
 fn maybe_refresh_in_background(
     libraries: Vec<neith::library::Library>,
-) -> mpsc::Receiver<Result<()>> {
+) -> mpsc::Receiver<neith::tui::RefreshEvent> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let result = ensure_indexes(&libraries, false, |_library, _stage| {}).map(|_| ());
-        let _ = sender.send(result);
+        let result = ensure_indexes(&libraries, false, |library, stage| {
+            let _ = sender.send(neith::tui::RefreshEvent::Progress {
+                alias: library.alias.clone(),
+                stage: stage.to_string(),
+            });
+        })
+        .map(|_| ());
+        let _ = sender.send(neith::tui::RefreshEvent::Finished(result));
     });
     receiver
 }

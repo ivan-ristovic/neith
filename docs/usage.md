@@ -48,6 +48,9 @@ neith --config ./config.toml
 
 ## TUI Keys
 
+The bottom row shows the result count, or a spinner and the current search or
+index refresh stage while work is in progress.
+
 | Key | Action |
 | --- | --- |
 | `Tab` | Switch results and preview focus. |

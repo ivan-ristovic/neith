@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -13,6 +14,63 @@ pub struct ManQuery {
     pub title: String,
     pub section: Option<String>,
     pub remainder: String,
+}
+
+#[derive(Default)]
+pub struct ManLookupCache {
+    entries: VecDeque<(String, Option<String>, Vec<SearchResult>)>,
+}
+
+impl ManLookupCache {
+    fn get_or_insert_with<F>(
+        &mut self,
+        title: &str,
+        section: &Option<String>,
+        resolve: F,
+    ) -> Vec<SearchResult>
+    where
+        F: FnOnce() -> Vec<SearchResult>,
+    {
+        if let Some(position) = self
+            .entries
+            .iter()
+            .position(|(cached_title, cached_section, _)| {
+                cached_title == title && cached_section == section
+            })
+        {
+            let entry = self.entries.remove(position).expect("cache entry exists");
+            let results = entry.2.clone();
+            self.entries.push_front(entry);
+            return results;
+        }
+        let results = resolve();
+        self.entries
+            .push_front((title.to_string(), section.clone(), results.clone()));
+        self.entries.truncate(16);
+        results
+    }
+}
+
+pub fn lookup_live_man_cached(
+    query: &str,
+    cache_dir: &Path,
+    cache: &mut ManLookupCache,
+) -> Vec<SearchResult> {
+    let Some(parts) = split_man_query(query) else {
+        return Vec::new();
+    };
+    let mut results = cache.get_or_insert_with(&parts.title, &parts.section, || {
+        lookup_live_man(query, cache_dir)
+    });
+    let search_text = if parts.remainder.is_empty() {
+        parts.title.as_str()
+    } else {
+        parts.remainder.as_str()
+    };
+    for result in &mut results {
+        (result.line, result.snippet) = best_line(&result.body, search_text);
+    }
+    results
 }
 
 pub fn lookup_live_man(query: &str, cache_dir: &Path) -> Vec<SearchResult> {

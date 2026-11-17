@@ -84,6 +84,31 @@ fn catalog_order_follows_discovery_order() {
     assert_eq!(second_order, first_order);
 }
 
+#[cfg(unix)]
+#[test]
+fn unchanged_index_keeps_manifest_and_catalog_files() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("note.md"), "# Note\n\nBody\n").unwrap();
+    let library = temp_library(temp.path());
+    ensure_indexes(std::slice::from_ref(&library), false, |_library, _stage| {}).unwrap();
+    let manifest_inode = std::fs::metadata(manifest_path(&library)).unwrap().ino();
+    let catalog_inode = std::fs::metadata(catalog_path(&library)).unwrap().ino();
+
+    let stats =
+        ensure_indexes(std::slice::from_ref(&library), false, |_library, _stage| {}).unwrap();
+    assert_eq!(stats[0].unchanged, 1);
+    assert_eq!(
+        std::fs::metadata(manifest_path(&library)).unwrap().ino(),
+        manifest_inode
+    );
+    assert_eq!(
+        std::fs::metadata(catalog_path(&library)).unwrap().ino(),
+        catalog_inode
+    );
+}
+
 #[test]
 fn exact_regex_matches_every_alternative_and_anchors() {
     let temp = tempfile::tempdir().unwrap();

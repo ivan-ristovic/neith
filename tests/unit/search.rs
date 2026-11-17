@@ -191,3 +191,62 @@ fn regex_matches_across_body_lines() {
         Some((2, "alpha".to_string()))
     );
 }
+
+#[test]
+fn regex_prefilter_never_rejects_matching_text() {
+    for pattern in [
+        "foo|bar",
+        "^Foo$",
+        "(?i)foo",
+        "f.o",
+        "(?s)alpha.*beta",
+        r"\d+",
+        "[a-z]+",
+    ] {
+        let regex = regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let prefilter = RegexPrefilter::new(pattern);
+        for text in ["Foo", "bar", "alpha\nbeta", "number 42", "unrelated"] {
+            if regex.is_match(text) {
+                let bloom = SearchBloom::for_entry("title", "path.md", text);
+                assert!(
+                    prefilter
+                        .as_ref()
+                        .is_none_or(|prefilter| prefilter.might_match(Some(bloom))),
+                    "pattern {pattern:?} rejected matching text {text:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn top_result_collection_is_bounded_and_ranked() {
+    let mut results = BinaryHeap::new();
+    for score in [1.0, 3.0, 2.0] {
+        let result = SearchResult {
+            title: score.to_string(),
+            path: PathBuf::from(format!("/tmp/{score}.md")),
+            rel_path: format!("{score}.md"),
+            library_alias: "test".to_string(),
+            source_kind: "note".to_string(),
+            line: 1,
+            snippet: String::new(),
+            score,
+            rank_reason: "regex".to_string(),
+            body: String::new(),
+            is_live_man: false,
+        };
+        retain_top_result(&mut results, result, 2);
+    }
+    let results = results
+        .into_sorted_vec()
+        .into_iter()
+        .map(|entry| entry.result)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].score, 3.0);
+    assert_eq!(results[1].score, 2.0);
+}

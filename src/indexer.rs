@@ -8,8 +8,8 @@ use tantivy::schema::*;
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term, doc};
 
 use crate::library::{
-    EntryDoc, FileSignature, Library, SourceKind, content_hash, discover_markdown_entries,
-    discover_signatures,
+    EntryDoc, FileSignature, Library, SearchBloom, SourceKind, content_hash,
+    discover_markdown_entries, discover_signatures,
 };
 
 const INDEX_VERSION: u32 = 1;
@@ -45,6 +45,8 @@ pub struct CatalogEntry {
     pub title: String,
     pub excerpt: String,
     pub source_kind: String,
+    #[serde(default)]
+    pub search_bloom: Option<SearchBloom>,
 }
 
 #[derive(Default, Debug, Serialize, Deserialize)]
@@ -149,7 +151,6 @@ where
     }
 
     let (index, fields, created_index) = open_index(library)?;
-    let mut writer: IndexWriter = index.writer(100_000_000)?;
 
     progress("reading entries");
     let entries = discover_markdown_entries(library)?;
@@ -169,22 +170,25 @@ where
         .iter()
         .map(|entry| entry.path.to_string_lossy().to_string())
         .collect::<HashSet<_>>();
-    for old_path in previous_by_path.keys() {
-        if !current_paths.contains(old_path) {
-            writer.delete_term(Term::from_field_text(fields.path_exact, old_path));
-            stats.removed += 1;
-        }
-    }
+    let removed_paths = previous_by_path
+        .keys()
+        .filter(|path| !current_paths.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    stats.removed = removed_paths.len();
 
     progress("indexing changed files");
     let mut next_manifest = IndexManifest {
         version: INDEX_VERSION,
         files: Vec::with_capacity(entries.len()),
     };
+    let mut changed_entries = Vec::new();
+    let mut metadata_upgraded = false;
 
     for entry in entries {
         let path = entry.path.to_string_lossy().to_string();
-        let signature = FileSignature {
+        let previous_signature = previous_by_path.get(&path);
+        let mut signature = FileSignature {
             path: path.clone(),
             rel_path: entry.rel_path.clone(),
             title: entry.title.clone(),
@@ -193,25 +197,58 @@ where
             size: entry.size,
             modified_unix: entry.modified_unix,
             content_hash: content_hash(&entry.body),
+            search_bloom: previous_signature.and_then(|old| old.search_bloom),
         };
-        if previous_by_path.get(&path) == Some(&signature) {
+        if previous_signature == Some(&signature) {
+            if signature.search_bloom.is_none() {
+                signature.search_bloom = Some(SearchBloom::for_entry(
+                    &entry.title,
+                    &entry.rel_path,
+                    &entry.body,
+                ));
+                metadata_upgraded = true;
+            }
             stats.unchanged += 1;
             next_manifest.files.push(signature);
             continue;
         }
-        writer.delete_term(Term::from_field_text(fields.path_exact, &path));
-        writer.add_document(entry_to_tantivy_doc(&fields, &entry))?;
+        signature.search_bloom = Some(SearchBloom::for_entry(
+            &entry.title,
+            &entry.rel_path,
+            &entry.body,
+        ));
         stats.indexed += 1;
         next_manifest.files.push(signature);
+        changed_entries.push(entry);
     }
 
-    if stats.indexed > 0 || stats.removed > 0 || !manifest_path(library).is_file() {
+    let manifest_exists = manifest_path(library).is_file();
+    let catalog_exists = catalog_path(library).is_file();
+    let needs_commit = created_index || stats.indexed > 0 || stats.removed > 0 || !manifest_exists;
+    if needs_commit {
+        let mut writer: IndexWriter = index.writer(100_000_000)?;
+        for path in removed_paths {
+            writer.delete_term(Term::from_field_text(fields.path_exact, &path));
+        }
+        for entry in changed_entries {
+            let path = entry.path.to_string_lossy();
+            writer.delete_term(Term::from_field_text(fields.path_exact, path.as_ref()));
+            writer.add_document(entry_to_tantivy_doc(&fields, &entry))?;
+        }
         progress("committing");
         writer.commit()?;
+        writer.wait_merging_threads()?;
     }
-    writer.wait_merging_threads()?;
-    write_manifest(library, &next_manifest)?;
-    write_catalog(library, &next_manifest)?;
+    let catalog_stale = manifest_exists
+        && catalog_exists
+        && fs::metadata(manifest_path(library))?.modified()?
+            > fs::metadata(catalog_path(library))?.modified()?;
+    if needs_commit || metadata_upgraded || !manifest_exists {
+        write_manifest(library, &next_manifest)?;
+    }
+    if needs_commit || metadata_upgraded || !catalog_exists || catalog_stale {
+        write_catalog(library, &next_manifest)?;
+    }
     Ok(stats)
 }
 
@@ -408,6 +445,7 @@ fn write_catalog(library: &Library, manifest: &IndexManifest) -> Result<()> {
             title: signature.title.clone(),
             excerpt: signature.excerpt.clone(),
             source_kind: signature.source_kind.as_str().to_string(),
+            search_bloom: signature.search_bloom,
         })
         .collect::<Vec<_>>();
     write_json_atomic(&catalog_path(library), &entries)

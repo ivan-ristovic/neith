@@ -78,3 +78,15 @@ fn excerpt_truncates_on_utf8_boundary() {
     assert!(excerpt.ends_with("..."));
     assert!(excerpt.is_char_boundary(excerpt.len()));
 }
+
+#[test]
+fn search_bloom_preserves_ascii_matches_and_defers_unicode() {
+    let bloom = SearchBloom::for_entry("Alpha", "notes/alpha.md", "needle end");
+    assert!(bloom.might_contain(b"ALPHA"));
+    assert!(bloom.might_contain(b"needle"));
+    assert!(!bloom.might_contain(b"unrelatedliteral"));
+
+    let unicode = SearchBloom::for_entry("Kelvin", "notes/kelvin.md", "\u{212A}");
+    assert!(!unicode.ascii_only);
+    assert!(unicode.might_contain(b"kelvin"));
+}

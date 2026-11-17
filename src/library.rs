@@ -85,6 +85,67 @@ pub struct FileSignature {
     pub size: u64,
     pub modified_unix: u64,
     pub content_hash: u64,
+    #[serde(default)]
+    pub search_bloom: Option<SearchBloom>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchBloom {
+    pub bits: [u64; 8],
+    pub ascii_only: bool,
+}
+
+impl SearchBloom {
+    pub fn for_entry(title: &str, rel_path: &str, body: &str) -> Self {
+        if !title.is_ascii() || !rel_path.is_ascii() || !body.is_ascii() {
+            return Self {
+                bits: [0; 8],
+                ascii_only: false,
+            };
+        }
+        let mut bloom = Self {
+            bits: [0; 8],
+            ascii_only: true,
+        };
+        for text in [title, rel_path, body] {
+            for gram in text.as_bytes().windows(3) {
+                bloom.insert(gram);
+            }
+        }
+        bloom
+    }
+
+    pub fn might_contain(&self, literal: &[u8]) -> bool {
+        if !self.ascii_only || literal.len() < 3 || !literal.is_ascii() {
+            return true;
+        }
+        literal.windows(3).all(|gram| {
+            let (first, second) = bloom_positions(gram);
+            self.bit_is_set(first) && self.bit_is_set(second)
+        })
+    }
+
+    fn insert(&mut self, gram: &[u8]) {
+        let (first, second) = bloom_positions(gram);
+        self.bits[first / 64] |= 1 << (first % 64);
+        self.bits[second / 64] |= 1 << (second % 64);
+    }
+
+    fn bit_is_set(&self, position: usize) -> bool {
+        self.bits[position / 64] & (1 << (position % 64)) != 0
+    }
+}
+
+fn bloom_positions(gram: &[u8]) -> (usize, usize) {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in gram {
+        hash ^= u64::from(byte.to_ascii_lowercase());
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (
+        (hash as usize) & 511,
+        (hash.rotate_right(23) as usize) & 511,
+    )
 }
 
 pub fn discover_markdown_entries(library: &Library) -> Result<Vec<EntryDoc>> {
@@ -114,6 +175,11 @@ pub fn discover_signatures(library: &Library) -> Result<Vec<FileSignature>> {
             .into_iter()
             .map(|entry| FileSignature {
                 content_hash: content_hash(&entry.body),
+                search_bloom: Some(SearchBloom::for_entry(
+                    &entry.title,
+                    &entry.rel_path,
+                    &entry.body,
+                )),
                 path: entry.path.to_string_lossy().to_string(),
                 rel_path: entry.rel_path,
                 title: entry.title,

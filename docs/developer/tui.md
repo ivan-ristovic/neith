@@ -58,6 +58,10 @@ The TUI builds `SearchRequest` from:
 - result limit
 
 Search is refreshed when query text, filter, mode, or library scope changes.
+The TUI sends requests to one worker thread. A short delay combines rapid
+keystrokes; newer requests cancel older scans. Results are cleared while a new
+search is pending, and the bottom row shows a spinner. Background index
+refreshes send stage updates to the same footer.
 
 ## Focus Modes
 
@@ -93,6 +97,8 @@ Preview source:
 2. Plain text fallback.
 
 `ui.preview_cursor_percent` controls cursor placement during scrolling.
+Raw and highlighted previews for small files are kept in a 16-entry cache,
+invalidated when file size or modification time changes.
 
 ## Editor Return
 

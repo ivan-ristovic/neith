@@ -78,20 +78,20 @@ Tantivy fields:
 2. Opens or creates the Tantivy index.
 3. Discovers current entries.
 4. Loads previous manifest.
-5. Deletes documents for removed paths.
-6. Compares each current entry signature.
-7. Reindexes changed entries.
-8. Commits when documents changed or no manifest exists.
-9. Waits for Tantivy merge threads to finish and releases the writer lock.
-10. Writes manifest.
-11. Writes catalog.
+5. Compares each current entry signature and finds removed paths.
+6. Opens a writer and commits only when Tantivy documents changed.
+7. Writes the manifest and catalog only when their contents changed or a cache
+   file is missing. Existing catalogs gain regex filter metadata without a
+   document rebuild.
 
 ## Manifest And Catalog
 
 `INDEX_VERSION` is currently `1`.
 
 The manifest stores `FileSignature` values. The catalog is derived from the
-manifest and stores metadata needed without loading full body text.
+manifest and stores metadata needed without loading full body text. Both store
+an optional 512-bit ASCII trigram filter. Missing filters in older caches are
+safe: regex search scans those entries until an index run fills them in.
 
 If an incompatible manifest format change is made, update `INDEX_VERSION`.
 Version mismatch loads as an empty manifest, causing existing files to be

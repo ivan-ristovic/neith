@@ -54,6 +54,66 @@ fn reload_search_engine_updates_catalog_results() {
     assert_eq!(app.results.len(), 2);
 }
 
+#[test]
+fn preview_cache_reuses_entries_and_invalidates_changed_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first.md");
+    let second = temp.path().join("second.md");
+    std::fs::write(&first, "first preview\n").unwrap();
+    std::fs::write(&second, "second preview\n").unwrap();
+    let mut app = test_app();
+    app.config.app.ui.preview_syntax = PreviewSyntax::Plain;
+    app.results = vec![
+        search_result(first.to_str().unwrap(), 1),
+        search_result(second.to_str().unwrap(), 1),
+    ];
+
+    app.load_selected_preview();
+    app.selected = 1;
+    app.load_selected_preview();
+    app.selected = 0;
+    app.load_selected_preview();
+    assert_eq!(app.preview_cache.len(), 2);
+    assert_eq!(app.preview_cache.front().unwrap().path, first);
+
+    std::fs::write(&first, "changed preview\n").unwrap();
+    app.load_selected_preview();
+    assert_eq!(app.preview.lines, vec!["changed preview"]);
+}
+
+#[test]
+fn footer_shows_search_and_index_refresh_progress() {
+    let mut app = test_app();
+    app.refresh_stage = Some("notes: reading entries".to_string());
+    assert!(
+        app.footer_text()
+            .contains("Refreshing indexes: notes: reading entries")
+    );
+    app.search_pending = true;
+    assert!(app.footer_text().contains("Searching..."));
+}
+
+#[test]
+fn search_worker_completes_without_blocking_app() {
+    let mut app = test_app();
+    app.search_worker = Some(SearchWorker::new());
+    app.results = vec![search_result("/tmp/old.md", 1)];
+    app.filter = SourceFilter::Content;
+    app.query = "missing".to_string();
+    app.refresh_indexed_results();
+    assert!(app.search_pending);
+    assert!(app.results.is_empty());
+
+    for _ in 0..200 {
+        app.poll_search();
+        if !app.search_pending {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!app.search_pending);
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }

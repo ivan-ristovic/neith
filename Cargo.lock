@@ -1140,6 +1140,7 @@ dependencies = [
  "nucleo-matcher",
  "ratatui",
  "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
  "tantivy",
