@@ -105,20 +105,27 @@ fn is_awk_field_ref(token: &str) -> bool {
 }
 
 pub fn has_regex_meta(query: &str) -> bool {
-    query.chars().any(|ch| {
-        matches!(
-            ch,
-            '.' | '*' | '+' | '?' | '[' | ']' | '(' | ')' | '{' | '}' | '|'
-        )
+    query.split_whitespace().any(|token| {
+        !is_awk_field_ref(token)
+            && token.chars().any(|ch| {
+                matches!(
+                    ch,
+                    '.' | '*'
+                        | '+'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                        | '|'
+                        | '^'
+                        | '$'
+                        | '\\'
+                )
+            })
     })
-}
-
-pub fn longest_literal_seed(pattern: &str) -> Option<String> {
-    pattern
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
-        .filter(|part| part.len() >= 2)
-        .max_by_key(|part| part.len())
-        .map(str::to_string)
 }
 
 #[cfg(test)]

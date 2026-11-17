@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -14,8 +15,7 @@ use crate::indexer::{CatalogEntry, IndexHandle, IndexManager, SearchFields};
 use crate::library::SourceKind;
 use crate::man;
 use crate::query::{
-    LibraryScope, MatchMode, SearchRequest, SourceFilter, has_regex_meta, longest_literal_seed,
-    normalize_query,
+    LibraryScope, MatchMode, SearchRequest, SourceFilter, has_regex_meta, normalize_query,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -72,13 +72,20 @@ impl SearchEngine {
     }
 
     pub fn search(&self, request: &SearchRequest) -> Vec<SearchResult> {
-        let query = normalize_query(&request.query);
+        let is_regex = request.mode == MatchMode::Exact && has_regex_meta(&request.query);
+        let query = if is_regex {
+            request.query.trim().to_string()
+        } else {
+            normalize_query(&request.query)
+        };
         let mut results = Vec::new();
         if query.trim().is_empty() {
             return self.empty_query_results(request);
         }
 
-        if matches!(request.filter, SourceFilter::All | SourceFilter::Man) {
+        if matches!(&request.library, LibraryScope::All)
+            && matches!(request.filter, SourceFilter::All | SourceFilter::Man)
+        {
             results.extend(man::lookup_live_man(&query, &self.man_cache_dir));
         }
         if matches!(
@@ -88,10 +95,13 @@ impl SearchEngine {
             results.extend(self.search_catalog_man_query(request, &query));
         }
 
-        let indexed_results = self.search_tantivy(request, &query);
-        results.extend(indexed_results);
-        if request.mode == MatchMode::Fuzzy && results.is_empty() {
-            results.extend(self.search_catalog_fuzzy(request, &query));
+        if is_regex {
+            results.extend(self.search_regex(request, &query));
+        } else {
+            results.extend(self.search_tantivy(request, &query));
+            if request.mode == MatchMode::Fuzzy && results.is_empty() {
+                results.extend(self.search_catalog_fuzzy(request, &query));
+            }
         }
 
         let mut by_path: HashMap<String, SearchResult> = HashMap::new();
@@ -119,13 +129,47 @@ impl SearchEngine {
     fn empty_query_results(&self, request: &SearchRequest) -> Vec<SearchResult> {
         let mut results = Vec::new();
         for handle in self.matching_handles(&request.library) {
-            for item in handle.catalog.iter().take(request.limit) {
-                if source_matches(request.filter, &item.source_kind) {
-                    results.push(result_from_catalog(item, 0.0, "catalog"));
+            for item in handle
+                .catalog
+                .iter()
+                .filter(|item| source_matches(request.filter, &item.source_kind))
+                .take(request.limit.saturating_sub(results.len()))
+            {
+                results.push(result_from_catalog(item, 0.0, "catalog"));
+            }
+        }
+        results
+    }
+
+    fn search_regex(&self, request: &SearchRequest, query: &str) -> Vec<SearchResult> {
+        let Ok(regex) = regex::RegexBuilder::new(query)
+            .case_insensitive(true)
+            .build()
+        else {
+            return Vec::new();
+        };
+        let mut results = Vec::new();
+        for handle in self.matching_handles(&request.library) {
+            for item in &handle.catalog {
+                if !source_matches(request.filter, &item.source_kind) {
+                    continue;
+                }
+                let mut result = result_from_catalog(item, 0.0, "regex");
+                if request.filter != SourceFilter::Names && request.filter != SourceFilter::Man {
+                    let Ok(body) = fs::read_to_string(&result.path) else {
+                        continue;
+                    };
+                    result.body = body;
+                }
+                if let Some((line, snippet)) = regex_match_snippet(&regex, &result, request.filter)
+                {
+                    result.line = line;
+                    result.snippet = snippet;
+                    apply_boosts(&mut result, query, request.filter, "regex");
+                    results.push(result);
                 }
             }
         }
-        results.truncate(request.limit);
         results
     }
 
@@ -135,18 +179,6 @@ impl SearchEngine {
         if query_texts.is_empty() {
             return Vec::new();
         }
-        let verification_regex = if request.mode == MatchMode::Exact && has_regex_meta(query) {
-            match regex::RegexBuilder::new(query)
-                .case_insensitive(true)
-                .build()
-            {
-                Ok(regex) => Some(regex),
-                Err(_) => return Vec::new(),
-            }
-        } else {
-            None
-        };
-
         for handle in self.matching_handles(&request.library) {
             let fields = fields_for_filter(&handle.fields, request.filter);
             let searcher = handle.reader.searcher();
@@ -166,13 +198,6 @@ impl SearchEngine {
                     if let Ok(mut result) = self.doc_to_result(handle, address, bm25, query) {
                         if !source_matches(request.filter, &result.source_kind) {
                             continue;
-                        }
-                        if let Some(regex) = &verification_regex {
-                            let Some((line, snippet)) = regex_match_snippet(regex, &result) else {
-                                continue;
-                            };
-                            result.line = line;
-                            result.snippet = snippet;
                         }
                         apply_boosts(&mut result, query, request.filter, "index");
                         results.push(result);
@@ -341,9 +366,6 @@ fn fields_for_filter(fields: &SearchFields, filter: SourceFilter) -> Vec<tantivy
 
 fn query_variants_for_index(mode: MatchMode, query: &str) -> Vec<String> {
     match mode {
-        MatchMode::Exact if has_regex_meta(query) => longest_literal_seed(query)
-            .map(|seed| vec![seed])
-            .unwrap_or_default(),
         MatchMode::Exact => vec![query.to_string()],
         MatchMode::Fuzzy => fuzzy_index_variants(query),
     }
@@ -619,12 +641,21 @@ fn truncate_to_char_boundary(value: &str, limit: usize) -> &str {
     &value[..end]
 }
 
-fn regex_match_snippet(regex: &regex::Regex, result: &SearchResult) -> Option<(usize, String)> {
-    if regex.is_match(&result.title) {
-        return Some((1, trim_snippet(&result.title)));
+fn regex_match_snippet(
+    regex: &regex::Regex,
+    result: &SearchResult,
+    filter: SourceFilter,
+) -> Option<(usize, String)> {
+    if filter != SourceFilter::Content {
+        if regex.is_match(&result.title) {
+            return Some((1, trim_snippet(&result.title)));
+        }
+        if regex.is_match(&result.rel_path) {
+            return Some((1, trim_snippet(&result.rel_path)));
+        }
     }
-    if regex.is_match(&result.rel_path) {
-        return Some((1, trim_snippet(&result.rel_path)));
+    if matches!(filter, SourceFilter::Names | SourceFilter::Man) {
+        return None;
     }
     for (idx, line) in result.body.lines().enumerate() {
         if regex.is_match(line) {
@@ -646,9 +677,6 @@ fn regex_match_snippet(regex: &regex::Regex, result: &SearchResult) -> Option<(u
             .map(trim_snippet)
             .unwrap_or_else(|| trim_snippet(&result.body[found.start()..found.end()]));
         return Some((line, snippet));
-    }
-    if regex.is_match(&result.snippet) {
-        return Some((result.line, trim_snippet(&result.snippet)));
     }
     None
 }

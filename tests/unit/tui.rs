@@ -37,6 +37,23 @@ fn test_app_with_libraries(libraries: Vec<Library>) -> App {
     App::new(config, engine, String::new())
 }
 
+#[test]
+fn reload_search_engine_updates_catalog_results() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = Library::new(temp.path().to_path_buf(), Some("test".to_string()), None);
+    std::fs::write(temp.path().join("first.md"), "# First\n").unwrap();
+    ensure_indexes(std::slice::from_ref(&library), false, |_library, _stage| {}).unwrap();
+    let mut app = test_app_with_libraries(vec![library.clone()]);
+    reload_search_engine(&mut app).unwrap();
+    assert_eq!(app.results.len(), 1);
+
+    std::fs::write(temp.path().join("second.md"), "# Second\n").unwrap();
+    ensure_indexes(std::slice::from_ref(&library), false, |_library, _stage| {}).unwrap();
+    assert_eq!(app.results.len(), 1);
+    reload_search_engine(&mut app).unwrap();
+    assert_eq!(app.results.len(), 2);
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }

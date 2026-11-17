@@ -83,3 +83,72 @@ fn catalog_order_follows_discovery_order() {
     assert_eq!(first_order, vec!["alpha.md", "beta.md", "gamma.md"]);
     assert_eq!(second_order, first_order);
 }
+
+#[test]
+fn exact_regex_matches_every_alternative_and_anchors() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("alpha.md"), "# Alpha\n").unwrap();
+    std::fs::write(temp.path().join("beta.md"), "# Beta\n\nnumber 42\n").unwrap();
+    let library = temp_library(temp.path());
+    ensure_indexes(std::slice::from_ref(&library), false, |_library, _stage| {}).unwrap();
+    let engine = SearchEngine::new(IndexManager::open(&[library]).unwrap());
+
+    let search = |query: &str| {
+        engine.search(&SearchRequest {
+            query: query.to_string(),
+            filter: SourceFilter::All,
+            mode: MatchMode::Exact,
+            library: LibraryScope::All,
+            limit: 10,
+        })
+    };
+    assert_eq!(search("^Alpha$|^Beta$").len(), 2);
+    assert_eq!(search(r"\d+").len(), 1);
+}
+
+#[test]
+fn empty_query_filters_before_limiting_catalog() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("a-note.md"), "# A note\n").unwrap();
+    std::fs::write(temp.path().join("z-man.md"), "# man: sample(1)\n").unwrap();
+    let library = temp_library(temp.path());
+    ensure_indexes(std::slice::from_ref(&library), false, |_library, _stage| {}).unwrap();
+    let engine = SearchEngine::new(IndexManager::open(&[library]).unwrap());
+
+    let results = engine.search(&SearchRequest {
+        query: String::new(),
+        filter: SourceFilter::Man,
+        mode: MatchMode::Fuzzy,
+        library: LibraryScope::All,
+        limit: 1,
+    });
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].rel_path, "z-man.md");
+}
+
+#[test]
+fn sectioned_man_query_keeps_catalog_lookup_in_exact_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("man")).unwrap();
+    std::fs::write(
+        temp.path().join("man/printf-3-example.md"),
+        "# man: printf (3)\n",
+    )
+    .unwrap();
+    let library = temp_library(temp.path());
+    ensure_indexes(std::slice::from_ref(&library), false, |_library, _stage| {}).unwrap();
+    let engine = SearchEngine::new(IndexManager::open(&[library]).unwrap());
+
+    let results = engine.search(&SearchRequest {
+        query: "printf(3)".to_string(),
+        filter: SourceFilter::Man,
+        mode: MatchMode::Exact,
+        library: LibraryScope::Alias("test".to_string()),
+        limit: 10,
+    });
+    assert!(
+        results
+            .iter()
+            .any(|result| result.rel_path == "man/printf-3-example.md")
+    );
+}

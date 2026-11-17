@@ -71,8 +71,9 @@ A file is unchanged only when every signature field matches:
 ## Startup Behavior
 
 The TUI and JSON query command ensure usable indexes before searching. If an
-index is missing, Neith builds it. The TUI also starts a background incremental
-refresh after opening.
+index is missing, Neith builds it. JSON queries also refresh existing indexes
+before searching. The TUI starts a background incremental refresh after opening
+and reloads its results when that refresh completes.
 
 ## Status
 

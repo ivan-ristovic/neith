@@ -82,8 +82,9 @@ Tantivy fields:
 6. Compares each current entry signature.
 7. Reindexes changed entries.
 8. Commits when documents changed or no manifest exists.
-9. Writes manifest.
-10. Writes catalog.
+9. Waits for Tantivy merge threads to finish and releases the writer lock.
+10. Writes manifest.
+11. Writes catalog.
 
 ## Manifest And Catalog
 

@@ -48,11 +48,11 @@ External crates:
 
 `SearchEngine::search`:
 
-1. Normalizes the query.
+1. Normalizes plain queries; preserves regex text.
 2. Returns catalog results for an empty query.
-3. Adds live man-page results for `all` and `man` filters.
+3. Adds live man-page results for `all` and `man` filters in the `all` library scope.
 4. Adds indexed man catalog matches for man query syntax.
-5. Runs Tantivy search.
+5. Runs Tantivy search for plain queries or scans catalog entries for regex queries.
 6. Runs fuzzy catalog fallback when fuzzy mode returns no results.
 7. Deduplicates by path.
 8. Sorts by score, then display line.
@@ -70,9 +70,11 @@ This is intentionally small and query-domain-specific.
 
 ## Exact Mode
 
-Exact mode still uses Tantivy query parsing. If the query contains regex
-metacharacters, Neith also builds a case-insensitive regex and verifies matches
-against result text before accepting them.
+Exact mode uses Tantivy query parsing for plain queries. If the query contains
+regex metacharacters, Neith builds a case-insensitive regex and checks catalog
+entries directly. It reads note bodies when the result filter permits content
+matches. This avoids losing regex matches through an incomplete index seed, but
+scans all entries in the selected scope.
 
 ## Live Man Lookup
 

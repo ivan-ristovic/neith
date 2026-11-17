@@ -209,6 +209,7 @@ where
         progress("committing");
         writer.commit()?;
     }
+    writer.wait_merging_threads()?;
     write_manifest(library, &next_manifest)?;
     write_catalog(library, &next_manifest)?;
     Ok(stats)

@@ -14,10 +14,8 @@ fn normalizes_ordinal_query_terms() {
 }
 
 #[test]
-fn extracts_regex_seed() {
-    assert_eq!(
-        longest_literal_seed("awk.*print"),
-        Some("print".to_string())
-    );
-    assert_eq!(longest_literal_seed("a.*b"), None);
+fn detects_regex_syntax_without_treating_awk_field_refs_as_regex() {
+    assert!(has_regex_meta("^alpha$|^beta$"));
+    assert!(has_regex_meta(r"\d+"));
+    assert!(!has_regex_meta("awk $3"));
 }

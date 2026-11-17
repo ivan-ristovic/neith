@@ -161,7 +161,7 @@ fn regex_matches_full_body() {
         .unwrap();
 
     assert_eq!(
-        regex_match_snippet(&regex, &result),
+        regex_match_snippet(&regex, &result, SourceFilter::All),
         Some((2, "alpha then beta".to_string()))
     );
 }
@@ -187,7 +187,7 @@ fn regex_matches_across_body_lines() {
         .unwrap();
 
     assert_eq!(
-        regex_match_snippet(&regex, &result),
+        regex_match_snippet(&regex, &result, SourceFilter::All),
         Some((2, "alpha".to_string()))
     );
 }

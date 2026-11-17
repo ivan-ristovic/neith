@@ -4,6 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 use ansi_to_tui::IntoText as _;
@@ -1049,14 +1050,59 @@ impl App {
 }
 
 pub fn run(config: RuntimeConfig, engine: SearchEngine, initial_query: String) -> Result<()> {
+    run_inner_with_refresh(config, engine, initial_query, None)
+}
+
+pub fn run_with_refresh(
+    config: RuntimeConfig,
+    engine: SearchEngine,
+    initial_query: String,
+    refresh: Receiver<Result<()>>,
+) -> Result<()> {
+    run_inner_with_refresh(config, engine, initial_query, Some(refresh))
+}
+
+fn run_inner_with_refresh(
+    config: RuntimeConfig,
+    engine: SearchEngine,
+    initial_query: String,
+    refresh: Option<Receiver<Result<()>>>,
+) -> Result<()> {
     let mut terminal = init_terminal()?;
-    let result = run_inner(&mut terminal, App::new(config, engine, initial_query));
+    let result = run_inner(
+        &mut terminal,
+        App::new(config, engine, initial_query),
+        refresh,
+    );
     restore_terminal();
     result
 }
 
-fn run_inner(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
+fn run_inner(
+    terminal: &mut DefaultTerminal,
+    mut app: App,
+    mut refresh: Option<Receiver<Result<()>>>,
+) -> Result<()> {
     loop {
+        if let Some(receiver) = &refresh {
+            match receiver.try_recv() {
+                Ok(Ok(())) => {
+                    if let Err(err) = reload_search_engine(&mut app) {
+                        app.status = format!("index refresh failed: {err:#}");
+                    }
+                    refresh = None;
+                }
+                Ok(Err(err)) => {
+                    app.status = format!("index refresh failed: {err:#}");
+                    refresh = None;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    app.status = "index refresh stopped".to_string();
+                    refresh = None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         terminal.draw(|frame| draw(frame, &mut app))?;
         if app.should_quit {
             return Ok(());
@@ -1141,6 +1187,10 @@ fn handle_editor_request(
 
 fn refresh_after_editor(app: &mut App) -> Result<()> {
     ensure_indexes(&app.config.libraries, false, |_library, _stage| {})?;
+    reload_search_engine(app)
+}
+
+fn reload_search_engine(app: &mut App) -> Result<()> {
     let manager = IndexManager::open(&app.config.libraries)?;
     app.engine = SearchEngine::new(manager);
     app.preview.path = None;

@@ -9,11 +9,15 @@ Neith searches indexed library entries and live man-page results.
 | Mode | Behavior |
 | --- | --- |
 | `fuzzy` | Default mode. Uses indexed search and a fuzzy catalog fallback. |
-| `exact` | Uses indexed search and verifies regex-like queries against result text. |
+| `exact` | Uses indexed search for plain queries. Regex queries scan matching library entries and verify the full pattern. |
 
 Neith normalizes ordinal query terms. For example, `3rd`, `nth`, and `$3` are
 normalized to `selected`, which helps queries such as `awk print 3rd column`
 match notes written with more generic wording.
+
+Regex queries use their original text. On large libraries, they can take longer
+than indexed searches because Neith checks each matching entry. Sectioned man
+queries such as `printf(3)` also use man-page lookup.
 
 ## Result Filters
 
@@ -29,7 +33,7 @@ match notes written with more generic wording.
 ## Library Scope
 
 `Ctrl-L` cycles pinned libraries. If a library picker opens, select a library
-or the `all` row.
+or the `all` row. Live man pages appear only in the `all` scope.
 
 ## Live Man Pages
 

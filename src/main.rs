@@ -1,4 +1,5 @@
 use std::process;
+use std::sync::mpsc;
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -77,7 +78,9 @@ fn run() -> Result<()> {
         }
         Some(Command::Json(args)) => match &args.command {
             JsonCommand::Query { query, limit } => {
-                ensure_ready_indexes(&runtime, cli.rebuild)?;
+                ensure_indexes(&runtime.libraries, cli.rebuild, |library, stage| {
+                    eprintln!("{}: {stage}", library.alias);
+                })?;
                 let manager = IndexManager::open(&runtime.libraries)?;
                 let engine = SearchEngine::new(manager);
                 let request = SearchRequest {
@@ -108,9 +111,10 @@ fn run() -> Result<()> {
         None => {
             ensure_ready_indexes(&runtime, cli.rebuild)?;
             let manager = IndexManager::open(&runtime.libraries)?;
-            maybe_refresh_in_background(runtime.libraries.clone());
+            let refresh = maybe_refresh_in_background(runtime.libraries.clone());
             let engine = SearchEngine::new(manager);
-            neith::tui::run(runtime, engine, cli.query.join(" ")).context("TUI failed")?;
+            neith::tui::run_with_refresh(runtime, engine, cli.query.join(" "), refresh)
+                .context("TUI failed")?;
         }
     }
 
@@ -149,8 +153,13 @@ fn ensure_ready_indexes(runtime: &RuntimeConfig, rebuild: bool) -> Result<()> {
     Ok(())
 }
 
-fn maybe_refresh_in_background(libraries: Vec<neith::library::Library>) {
+fn maybe_refresh_in_background(
+    libraries: Vec<neith::library::Library>,
+) -> mpsc::Receiver<Result<()>> {
+    let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let _ = ensure_indexes(&libraries, false, |_library, _stage| {});
+        let result = ensure_indexes(&libraries, false, |_library, _stage| {}).map(|_| ());
+        let _ = sender.send(result);
     });
+    receiver
 }
