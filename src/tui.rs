@@ -29,6 +29,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::action::{copy_text, open_editor, open_editor_in_tmux_pane};
 use crate::config::{EditorReturn, PreviewSyntax, RuntimeConfig, UiConfig};
 use crate::indexer::{IndexManager, ensure_indexes};
+use crate::library::Library;
 use crate::note;
 use crate::query::{LibraryScope, MatchMode, SearchRequest, SourceFilter, normalize_query};
 use crate::quick_copy::{self, CodeBlock, ExtractedCopy};
@@ -37,6 +38,15 @@ use crate::search::{SearchEngine, SearchResult};
 const MOUSE_SCROLL_LINES: isize = 3;
 const PREVIEW_CACHE_CAPACITY: usize = 16;
 const PREVIEW_CACHE_MAX_FILE_BYTES: u64 = 128 * 1024;
+
+fn add_entry_hint(edit_path: bool) -> String {
+    if edit_path {
+        "Path | Enter edit draft | Ctrl-P pick folder | Tab entry | Esc cancel".to_string()
+    } else {
+        "Folder + title | Enter edit draft | Ctrl-P pick folder | Tab path | Esc cancel".to_string()
+    }
+}
+
 const BAT_PREVIEW_ARGS: &[&str] = &[
     "--color=always",
     "--paging=never",
@@ -158,10 +168,33 @@ struct PreviewCacheEntry {
     syntax_lines: Vec<Line<'static>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct EditorRequest {
-    path: PathBuf,
-    line: Option<usize>,
+#[derive(Debug)]
+enum EditorRequest {
+    Open { path: PathBuf, line: Option<usize> },
+    Add(note::NoteEdit),
+}
+
+impl EditorRequest {
+    fn editor_path(&self) -> &Path {
+        match self {
+            Self::Open { path, .. } => path,
+            Self::Add(edit) => edit.editor_path(),
+        }
+    }
+
+    fn line(&self) -> Option<usize> {
+        match self {
+            Self::Open { line, .. } => *line,
+            Self::Add(_) => None,
+        }
+    }
+
+    fn finish(self, editor_succeeded: bool) -> Result<note::NoteEditOutcome> {
+        match self {
+            Self::Open { .. } => Ok(note::NoteEditOutcome::OpenedExisting),
+            Self::Add(edit) => edit.finish(editor_succeeded),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -174,8 +207,11 @@ struct ResultRefineState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AddEntryState {
     note_query: String,
+    title_cursor: usize,
     path_text: String,
     path_cursor: usize,
+    edit_path: bool,
+    path_custom: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,6 +249,7 @@ pub struct App {
     add_entry: Option<AddEntryState>,
     quick_copy: Option<QuickCopyState>,
     pending_editor: Option<EditorRequest>,
+    pending_folder_picker: Option<Library>,
     tmux_pane_opener: fn(&str, &Path, Option<usize>) -> Result<()>,
     should_quit: bool,
 }
@@ -262,6 +299,7 @@ impl App {
             add_entry: None,
             quick_copy: None,
             pending_editor: None,
+            pending_folder_picker: None,
             tmux_pane_opener: open_editor_in_tmux_pane,
             should_quit: false,
         };
@@ -279,6 +317,15 @@ impl App {
     }
 
     fn footer_text(&self) -> String {
+        if let Some(add_entry) = &self.add_entry {
+            return if add_entry.edit_path {
+                format!(" Title: {}", add_entry.note_query)
+            } else if add_entry.path_text.is_empty() {
+                " Enter a folder and title, or Ctrl-P to pick a folder".to_string()
+            } else {
+                format!(" Save to: {}", add_entry.path_text)
+            };
+        }
         let spinner = |started: Instant| {
             let frames = ['|', '/', '-', '\\'];
             frames[(started.elapsed().as_millis() / 120) as usize % frames.len()]
@@ -850,22 +897,41 @@ impl App {
     }
 
     fn begin_add_entry(&mut self) {
-        let note_query = self.note_query_for_new_entry();
-        match note::infer_note_path(&self.config.libraries, &note_query) {
-            Ok(path) => {
-                let path_text = path.display().to_string();
+        let note_query = self.note_query_for_new_entry().trim().to_string();
+        match self.note_target_library() {
+            Ok(_) => {
+                let path_text = self
+                    .infer_add_path(&note_query)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
                 self.add_entry = Some(AddEntryState {
+                    title_cursor: note_query.len(),
                     note_query,
                     path_cursor: path_text.len(),
                     path_text,
+                    edit_path: false,
+                    path_custom: false,
                 });
                 self.focus = Focus::AddEntry;
-                self.status = "add entry: edit path, Enter open template, Esc cancel".to_string();
+                self.status = add_entry_hint(false);
             }
             Err(err) => {
                 self.status = format!("add failed: {err:#}");
             }
         }
+    }
+
+    fn note_target_library(&self) -> Result<&Library> {
+        if let LibraryScope::Alias(alias) = self.current_library_scope()
+            && let Some(library) = self.config.libraries.iter().find(|lib| lib.alias == alias)
+        {
+            return Ok(library);
+        }
+        note::target_library(&self.config.libraries)
+    }
+
+    fn infer_add_path(&self, title: &str) -> Result<PathBuf> {
+        note::infer_note_path_in_library(self.note_target_library()?, title)
     }
 
     fn note_query_for_new_entry(&self) -> String {
@@ -885,23 +951,151 @@ impl App {
         let Some(state) = &self.add_entry else {
             return;
         };
+        if let Err(err) = note::validate_note_input(&state.note_query) {
+            self.status = format!("add failed: {err}");
+            return;
+        }
         let path_text = state.path_text.trim();
         if path_text.is_empty() {
             self.status = "add failed: path is empty".to_string();
             return;
         }
         let path = expand_tilde_path(path_text);
-        match note::create_note(&path, &state.note_query) {
-            Ok(()) => {
+        match note::prepare_note_edit(&path, &state.note_query) {
+            Ok(edit) => {
                 self.add_entry = None;
                 self.focus = Focus::Results;
-                self.status = format!("opening {}", path.display());
-                self.pending_editor = Some(EditorRequest { path, line: None });
+                self.status = format!("editing {}", path.display());
+                self.pending_editor = Some(EditorRequest::Add(edit));
             }
             Err(err) => {
                 self.status = format!("add failed: {err:#}");
             }
         }
+    }
+
+    fn update_add_path_from_title(&mut self) {
+        if self
+            .add_entry
+            .as_ref()
+            .is_some_and(|state| state.path_custom)
+        {
+            return;
+        }
+        let Some(title) = self
+            .add_entry
+            .as_ref()
+            .map(|state| state.note_query.clone())
+        else {
+            return;
+        };
+        match self.infer_add_path(&title) {
+            Ok(path) => {
+                if let Some(state) = &mut self.add_entry {
+                    state.path_text = path.display().to_string();
+                    state.path_cursor = state.path_text.len();
+                }
+                self.status = add_entry_hint(false);
+            }
+            Err(_) => {
+                if let Some(state) = &mut self.add_entry {
+                    state.path_text.clear();
+                    state.path_cursor = 0;
+                }
+                self.status = add_entry_hint(false);
+            }
+        }
+    }
+
+    fn request_folder_picker(&mut self) {
+        match self.note_target_library() {
+            Ok(library) => self.pending_folder_picker = Some(library.clone()),
+            Err(err) => self.status = format!("folder picker failed: {err:#}"),
+        }
+    }
+
+    fn apply_selected_folder(&mut self, folder: &str) {
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        state.note_query = note::replace_note_folder(&state.note_query, folder);
+        state.title_cursor = state.note_query.len();
+        state.path_custom = false;
+        state.edit_path = false;
+        self.update_add_path_from_title();
+    }
+
+    fn insert_add_title_char(&mut self, ch: char) {
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        state.note_query.insert(state.title_cursor, ch);
+        state.title_cursor += ch.len_utf8();
+        self.update_add_path_from_title();
+    }
+
+    fn backspace_add_title_char(&mut self) {
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        let Some((start, _)) = previous_char(&state.note_query, state.title_cursor) else {
+            return;
+        };
+        state
+            .note_query
+            .replace_range(start..state.title_cursor, "");
+        state.title_cursor = start;
+        self.update_add_path_from_title();
+    }
+
+    fn delete_previous_add_title_word(&mut self) {
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        let mut start = state.title_cursor;
+        while let Some((idx, ch)) = previous_char(&state.note_query, start) {
+            if !ch.is_whitespace() {
+                break;
+            }
+            start = idx;
+        }
+        while let Some((idx, ch)) = previous_char(&state.note_query, start) {
+            if ch.is_whitespace() {
+                break;
+            }
+            start = idx;
+        }
+        state
+            .note_query
+            .replace_range(start..state.title_cursor, "");
+        state.title_cursor = start;
+        self.update_add_path_from_title();
+    }
+
+    fn move_add_title_left(&mut self) {
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        if let Some((idx, _)) = previous_char(&state.note_query, state.title_cursor) {
+            state.title_cursor = idx;
+        }
+    }
+
+    fn move_add_title_right(&mut self) {
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        if let Some((idx, ch)) = next_char(&state.note_query, state.title_cursor) {
+            state.title_cursor = idx + ch.len_utf8();
+        }
+    }
+
+    fn toggle_add_field(&mut self) {
+        let Some(state) = &mut self.add_entry else {
+            return;
+        };
+        state.edit_path = !state.edit_path;
+        self.status = add_entry_hint(state.edit_path);
     }
 
     fn clamp_add_path_cursor(&mut self) {
@@ -921,6 +1115,7 @@ impl App {
         };
         state.path_text.insert(state.path_cursor, ch);
         state.path_cursor += ch.len_utf8();
+        state.path_custom = true;
     }
 
     fn backspace_add_path_char(&mut self) {
@@ -933,6 +1128,7 @@ impl App {
         };
         state.path_text.replace_range(start..state.path_cursor, "");
         state.path_cursor = start;
+        state.path_custom = true;
     }
 
     fn delete_previous_add_path_word(&mut self) {
@@ -958,6 +1154,7 @@ impl App {
         }
         state.path_text.replace_range(start..state.path_cursor, "");
         state.path_cursor = start;
+        state.path_custom = true;
     }
 
     fn move_add_path_left(&mut self) {
@@ -1040,7 +1237,7 @@ impl App {
             self.status = "no result selected".to_string();
             return;
         };
-        self.pending_editor = Some(EditorRequest {
+        self.pending_editor = Some(EditorRequest::Open {
             path: result.path.clone(),
             line: (result.line > 0).then_some(result.line),
         });
@@ -1162,9 +1359,14 @@ impl App {
     }
 
     fn handle_add_entry_key(&mut self, key: KeyEvent) -> Result<()> {
+        let edit_path = self.add_entry.as_ref().is_some_and(|state| state.edit_path);
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('w') | KeyCode::Char('W') => self.delete_previous_add_path_word(),
+                KeyCode::Char('p') | KeyCode::Char('P') => self.request_folder_picker(),
+                KeyCode::Char('w') | KeyCode::Char('W') if edit_path => {
+                    self.delete_previous_add_path_word()
+                }
+                KeyCode::Char('w') | KeyCode::Char('W') => self.delete_previous_add_title_word(),
                 _ => {}
             }
             return Ok(());
@@ -1173,10 +1375,15 @@ impl App {
         match key.code {
             KeyCode::Esc => self.cancel_add_entry(),
             KeyCode::Enter => self.confirm_add_entry(),
-            KeyCode::Left => self.move_add_path_left(),
-            KeyCode::Right => self.move_add_path_right(),
-            KeyCode::Backspace => self.backspace_add_path_char(),
-            KeyCode::Char(ch) => self.insert_add_path_char(ch),
+            KeyCode::Tab => self.toggle_add_field(),
+            KeyCode::Left if edit_path => self.move_add_path_left(),
+            KeyCode::Right if edit_path => self.move_add_path_right(),
+            KeyCode::Backspace if edit_path => self.backspace_add_path_char(),
+            KeyCode::Char(ch) if edit_path => self.insert_add_path_char(ch),
+            KeyCode::Left => self.move_add_title_left(),
+            KeyCode::Right => self.move_add_title_right(),
+            KeyCode::Backspace => self.backspace_add_title_char(),
+            KeyCode::Char(ch) => self.insert_add_title_char(ch),
             _ => {}
         }
         Ok(())
@@ -1377,6 +1584,9 @@ fn run_inner(
                     return Ok(());
                 }
             }
+            if let Some(library) = app.pending_folder_picker.take() {
+                handle_folder_picker_request(terminal, &mut app, &library)?;
+            }
         }
     }
 }
@@ -1413,32 +1623,52 @@ fn handle_editor_request(
     request: EditorRequest,
 ) -> Result<()> {
     restore_terminal();
-    let editor_result = open_editor(&app.config.app.editor.command, &request.path, request.line);
+    let editor_result = open_editor(
+        &app.config.app.editor.command,
+        request.editor_path(),
+        request.line(),
+    );
+    let outcome = request.finish(editor_result.as_ref().is_ok_and(|status| status.success()));
 
     match app.config.app.editor.return_behavior {
         EditorReturn::Exit => {
             app.should_quit = true;
             editor_result?;
+            outcome?;
         }
         EditorReturn::Resume => {
             *terminal = init_terminal()?;
-            match editor_result {
-                Ok(status) => match refresh_after_editor(app) {
-                    Ok(()) if status.success() => {
-                        app.status = "returned from editor".to_string();
-                    }
-                    Ok(()) => {
-                        app.status = editor_status_message(status);
-                    }
-                    Err(err) => {
-                        app.status = format!("refresh failed: {err:#}");
-                    }
+            match (editor_result, outcome) {
+                (Ok(_), Ok(note::NoteEditOutcome::Discarded)) => {
+                    app.status = "new entry cancelled; no file created".to_string();
+                }
+                (Ok(status), Ok(_)) => match refresh_after_editor(app) {
+                    Ok(()) if status.success() => app.status = "returned from editor".to_string(),
+                    Ok(()) => app.status = editor_status_message(status),
+                    Err(err) => app.status = format!("refresh failed: {err:#}"),
                 },
-                Err(err) => {
+                (Ok(_), Err(err)) => app.status = format!("add failed: {err:#}"),
+                (Err(err), _) => {
                     app.status = format!("editor failed: {err}");
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn handle_folder_picker_request(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    library: &Library,
+) -> Result<()> {
+    restore_terminal();
+    let selected = note::pick_note_folder(library);
+    *terminal = init_terminal()?;
+    match selected {
+        Ok(Some(folder)) => app.apply_selected_folder(&folder),
+        Ok(None) => app.status = "folder selection cancelled".to_string(),
+        Err(err) => app.status = format!("folder picker failed: {err:#}"),
     }
     Ok(())
 }
@@ -1552,7 +1782,7 @@ fn draw_results(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
     let header = if app.status.is_empty() {
         match app.focus {
-            Focus::AddEntry => "Enter create/open | Esc cancel | Left/Right edit path | C-Q quit",
+            Focus::AddEntry => "Enter edit draft | Ctrl-P pick folder | Tab path | Esc cancel",
             Focus::Preview => {
                 "Tab results | Enter copy | C-C copy | C-A add | C-X exact | C-F filter | C-T type | C-L lib | C-H help"
             }
@@ -1595,14 +1825,20 @@ fn prompt_line(app: &App) -> Line<'static> {
     let colors = &app.config.app.ui.prompt.colors;
     if let Some(add_entry) = &app.add_entry {
         let right_separator = prompt_right_separator(app);
+        let label = if add_entry.edit_path { "path" } else { "entry" };
+        let text = if add_entry.edit_path {
+            &add_entry.path_text
+        } else {
+            &add_entry.note_query
+        };
         return Line::from(vec![
-            Span::styled("add", prompt_color_style(&colors.add, Color::Cyan)),
+            Span::styled(label, prompt_color_style(&colors.add, Color::Cyan)),
             Span::styled(
                 format!("{right_separator} "),
                 prompt_color_style(&colors.marker, Color::DarkGray),
             ),
             Span::styled(
-                add_entry.path_text.clone(),
+                text.clone(),
                 prompt_color_style(&colors.query, Color::White),
             ),
         ]);
@@ -1645,11 +1881,20 @@ fn prompt_line(app: &App) -> Line<'static> {
 
 fn prompt_parts(app: &App) -> (String, String, usize) {
     if let Some(add_entry) = &app.add_entry {
-        return (
-            "add> ".to_string(),
-            add_entry.path_text.clone(),
-            add_entry.path_cursor,
-        );
+        let right_separator = prompt_right_separator(app);
+        return if add_entry.edit_path {
+            (
+                format!("path{right_separator} "),
+                add_entry.path_text.clone(),
+                add_entry.path_cursor,
+            )
+        } else {
+            (
+                format!("entry{right_separator} "),
+                add_entry.note_query.clone(),
+                add_entry.title_cursor,
+            )
+        };
     }
 
     let mode = match app.mode {
@@ -2207,8 +2452,9 @@ fn help_lines() -> &'static [(&'static str, &'static str)] {
         ("q/Enter/Space", "close this help popup"),
         ("Ctrl-Q", "quit from any mode"),
         ("Esc", "cancel popup/copy/focus; quit from results"),
-        ("Tab", "switch results and preview focus; close popups"),
+        ("Tab", "switch focus; in add prompt, switch entry/path"),
         ("Ctrl-A", "add a new library entry from the current query"),
+        ("Ctrl-P", "in add prompt, pick a folder with fzf"),
         ("Ctrl-C", "quick-copy the selected note payload"),
         ("Ctrl-O", "open selected result in a new tmux pane"),
         ("Ctrl-W", "delete previous query word"),

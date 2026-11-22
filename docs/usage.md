@@ -38,7 +38,8 @@ neith --config ./config.toml
 | `neith status --json` | Print status as JSON. |
 | `neith healthcheck` | Check config, libraries, indexes, editor, clipboard, `man`, and `col`. |
 | `neith healthcheck --json` | Print healthcheck as JSON. |
-| `neith add <query...>` | Create or open a note and launch the editor. |
+| `neith add <folder> <title...>` | Create or open a note and launch the editor. |
+| `neith add --pick-folder <title...>` | Choose a folder with `fzf`, then edit a note. |
 | `neith config init` | Write config from resolved runtime libraries. |
 | `neith config init --force` | Overwrite an existing config. |
 | `neith completions bash` | Print bash completions. |
@@ -58,6 +59,7 @@ index refresh stage while work is in progress.
 | `Ctrl-Q` | Quit from any mode. |
 | `Esc` | Cancel popup/copy/focus, or quit from results. |
 | `Ctrl-A` | Add a new library entry from the current query. |
+| `Ctrl-P` in add prompt | Pick an existing folder with `fzf`. |
 | `Ctrl-C` | Quick-copy the selected note payload. |
 | `Ctrl-O` | Open the selected result in a new tmux pane. |
 | `Ctrl-W` | Delete the previous query word. |

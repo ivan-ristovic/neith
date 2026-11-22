@@ -33,6 +33,7 @@ Clipboard backends are tried in this order:
 | --- | --- |
 | `bat` or `batcat` | Syntax-highlighted previews. |
 | `tmux` | Popup usage and `Ctrl-O` pane opens. |
+| `fzf` | Interactive folder selection for new notes. |
 
 If `preview_syntax = "auto"`, Neith uses `bat` or `batcat` when available and
 falls back to plain preview.
@@ -54,7 +55,7 @@ Main crate dependencies:
 | `regex` | Exact-mode regex verification. |
 | `dirs` | Config and cache directory resolution. |
 | `ansi-to-tui` | Converting `bat` ANSI output for preview rendering. |
-| `tempfile` | Tests. |
+| `tempfile` | Temporary note drafts and tests. |
 
 Related developer docs:
 

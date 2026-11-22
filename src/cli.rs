@@ -26,6 +26,8 @@ pub struct Cli {
 pub enum Command {
     Index(IndexArgs),
     Add(AddArgs),
+    #[command(name = "__complete-folders", hide = true)]
+    CompleteFolders(CompleteFoldersArgs),
     Completions(CompletionsArgs),
     Config(ConfigArgs),
     Healthcheck(HealthcheckArgs),
@@ -53,7 +55,21 @@ pub struct StatusArgs {
 
 #[derive(Debug, Args)]
 pub struct AddArgs {
+    #[arg(
+        long,
+        help = "Choose an existing folder with fzf; remaining words are the title"
+    )]
+    pub pick_folder: bool,
+    #[arg(
+        value_name = "WORDS",
+        help = "Folder followed by title, or title with --pick-folder"
+    )]
     pub query: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct CompleteFoldersArgs {
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Args)]

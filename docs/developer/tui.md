@@ -70,7 +70,7 @@ refreshes send stage updates to the same footer.
 | `Results` | Edit query and select results. |
 | `Preview` | Scroll preview and select lines to copy. |
 | `LibrarySelector` | Choose one library or all libraries. |
-| `AddEntry` | Edit inferred note path. |
+| `AddEntry` | Edit a folder and title, pick a folder with `fzf`, or edit the inferred path. |
 | `QuickCopy` | Choose a code block from a multi-block note. |
 | `Help` | Show key reference. |
 

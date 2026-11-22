@@ -282,13 +282,11 @@ fn enter_in_results_requests_editor_open() {
     app.handle_key(key(KeyCode::Enter)).unwrap();
 
     assert_eq!(app.focus, Focus::Results);
-    assert_eq!(
+    assert!(matches!(
         app.pending_editor,
-        Some(EditorRequest {
-            path: PathBuf::from("/tmp/example.md"),
-            line: Some(7),
-        })
-    );
+        Some(EditorRequest::Open { ref path, line: Some(7) })
+            if path == &PathBuf::from("/tmp/example.md")
+    ));
 }
 
 #[test]
@@ -302,7 +300,7 @@ fn ctrl_o_opens_selected_result_in_tmux_pane_and_quits() {
     app.handle_key(ctrl_key('o')).unwrap();
 
     assert!(app.should_quit);
-    assert_eq!(app.pending_editor, None);
+    assert!(app.pending_editor.is_none());
     assert_eq!(
         *TMUX_OPEN_CALL.lock().unwrap(),
         Some(TmuxOpenCall {
@@ -322,7 +320,7 @@ fn ctrl_o_failure_keeps_neith_open() {
     app.handle_key(ctrl_key('o')).unwrap();
 
     assert!(!app.should_quit);
-    assert_eq!(app.pending_editor, None);
+    assert!(app.pending_editor.is_none());
     assert_eq!(app.status, "tmux pane open failed: tmux missing");
 }
 
@@ -333,7 +331,7 @@ fn tab_in_results_focuses_preview() {
     app.handle_key(key(KeyCode::Tab)).unwrap();
 
     assert_eq!(app.focus, Focus::Preview);
-    assert_eq!(app.pending_editor, None);
+    assert!(app.pending_editor.is_none());
 }
 
 #[test]
@@ -357,7 +355,7 @@ fn enter_in_preview_still_starts_copy_selection() {
 
     assert!(app.preview.copy_mode);
     assert_eq!(app.preview.anchor, Some(1));
-    assert_eq!(app.pending_editor, None);
+    assert!(app.pending_editor.is_none());
 }
 
 #[test]
@@ -525,15 +523,17 @@ fn ctrl_a_enters_add_entry_with_inferred_path() {
         add_entry.path_text,
         temp.path()
             .join("awk")
-            .join("awk-print-selected-fields.md")
+            .join("print-selected-fields.md")
             .display()
             .to_string()
     );
     assert_eq!(add_entry.path_cursor, add_entry.path_text.len());
+    assert_eq!(add_entry.title_cursor, add_entry.note_query.len());
+    assert!(!add_entry.edit_path);
 }
 
 #[test]
-fn add_entry_confirm_creates_template_note_and_requests_editor() {
+fn add_entry_confirm_prepares_draft_and_saves_only_after_editor_write() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join(".neith-note-template.md"),
@@ -556,13 +556,110 @@ fn add_entry_confirm_creates_template_note_and_requests_editor() {
     add_entry.path_cursor = add_entry.path_text.len();
     app.handle_key(key(KeyCode::Enter)).unwrap();
 
+    assert!(!path.exists());
+    let edit = match app.pending_editor.take().unwrap() {
+        EditorRequest::Add(edit) => edit,
+        _ => panic!("expected draft"),
+    };
     assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
+        std::fs::read_to_string(edit.editor_path()).unwrap(),
         "# Entry\n\nTask: awk print selected fields\n"
     );
-    assert_eq!(app.pending_editor, Some(EditorRequest { path, line: None }));
+    std::fs::write(edit.editor_path(), "# Entry\n\nSaved text\n").unwrap();
+    assert_eq!(
+        edit.finish(true).unwrap(),
+        note::NoteEditOutcome::Created(path.clone())
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "# Entry\n\nSaved text\n"
+    );
     assert_eq!(app.focus, Focus::Results);
     assert_eq!(app.add_entry, None);
+}
+
+#[test]
+fn add_entry_empty_query_requires_title_and_infers_path_as_typed() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = Library::new(temp.path().to_path_buf(), Some("notes".to_string()), None);
+    let mut app = test_app_with_libraries(vec![library]);
+
+    app.handle_key(ctrl_key('a')).unwrap();
+    assert_eq!(app.add_entry.as_ref().unwrap().path_text, "");
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert!(app.pending_editor.is_none());
+    for ch in "New idea".chars() {
+        app.handle_key(key(KeyCode::Char(ch))).unwrap();
+    }
+    let state = app.add_entry.as_ref().unwrap();
+    assert_eq!(state.note_query, "New idea");
+    assert_eq!(
+        state.path_text,
+        temp.path().join("new/idea.md").display().to_string()
+    );
+    app.handle_key(key(KeyCode::Tab)).unwrap();
+    assert!(app.add_entry.as_ref().unwrap().edit_path);
+    app.handle_key(key(KeyCode::Char('x'))).unwrap();
+    let custom_path = app.add_entry.as_ref().unwrap().path_text.clone();
+    app.handle_key(key(KeyCode::Tab)).unwrap();
+    app.handle_key(key(KeyCode::Char('!'))).unwrap();
+    assert_eq!(app.add_entry.as_ref().unwrap().path_text, custom_path);
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(!temp.path().join("new").exists());
+}
+
+#[test]
+fn add_entry_uses_selected_library_scope() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let libraries = vec![
+        Library::new(
+            first.path().to_path_buf(),
+            Some("neith-lib".to_string()),
+            Some(true),
+        ),
+        Library::new(
+            second.path().to_path_buf(),
+            Some("second".to_string()),
+            Some(true),
+        ),
+    ];
+    let mut app = test_app_with_libraries(libraries);
+    app.library_index = 2;
+    app.query = "New idea".to_string();
+    app.query_cursor = app.query.len();
+
+    app.handle_key(ctrl_key('a')).unwrap();
+
+    assert_eq!(
+        app.add_entry.as_ref().unwrap().path_text,
+        second.path().join("new/idea.md").display().to_string()
+    );
+}
+
+#[test]
+fn selected_folder_replaces_prefix_and_preserves_title() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("shell tools")).unwrap();
+    let library = Library::new(temp.path().to_path_buf(), Some("notes".to_string()), None);
+    let mut app = test_app_with_libraries(vec![library]);
+    app.query = "bash enable strict mode".to_string();
+    app.query_cursor = app.query.len();
+    app.handle_key(ctrl_key('a')).unwrap();
+    app.handle_key(ctrl_key('p')).unwrap();
+    assert!(app.pending_folder_picker.is_some());
+
+    app.apply_selected_folder("shell tools");
+
+    let state = app.add_entry.as_ref().unwrap();
+    assert_eq!(state.note_query, "\"shell tools\" enable strict mode");
+    assert_eq!(
+        state.path_text,
+        temp.path()
+            .join("shell tools/enable-strict-mode.md")
+            .display()
+            .to_string()
+    );
 }
 
 #[test]

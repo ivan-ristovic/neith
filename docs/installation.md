@@ -61,6 +61,9 @@ neith completions bash > ~/.local/share/bash-completion/completions/neith
 neith completions zsh > ~/.local/share/zsh/site-functions/_neith
 ```
 
+Regenerate installed completions after upgrading Neith. The add command's
+first argument is completed from the current target library directories.
+
 ## First Run
 
 Create a config from explicit libraries:
